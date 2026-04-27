@@ -835,16 +835,36 @@ io.on('connection', (socket: any) => {
 
     const card = player.hand[cardIdx];
 
+    // --- REGRA: Ás do trunfo antes do 7 ---
+    // Exceção: jogador tem AMBOS 7 e Ás na mão (pode jogar o Ás pois tem o 7)
     if (card.suit === state.trumpSuit && card.value === 'A' && !game.sevenTrumpPlayed && state.deck.length > 0) {
-      const hasOtherCards = player.hand.filter((_, i) => i !== cardIdx).length > 0;
-      if (hasOtherCards) {
+      const hasTrumpSeven = player.hand.some((c, i) => i !== cardIdx && c.suit === state.trumpSuit && c.value === '7');
+      if (player.hand.length > 1 && !hasTrumpSeven) {
         socket.emit('error', 'O Ás do trunfo não pode ser jogado antes do 7 do trunfo!');
         return;
       }
     }
 
+    // --- REGRA: 7 do trunfo não pode sair de fundo (último a jogar) ---
+    // Exceção: baralho vazio OU tem o Ás do trunfo na mão (revela que tem o Ás)
+    if (card.suit === state.trumpSuit && card.value === '7' && state.vaza.length === 3) {
+      const hasTrumpAce = player.hand.some((c, i) => i !== cardIdx && c.suit === state.trumpSuit && c.value === 'A');
+      if (state.deck.length > 0 && !hasTrumpAce) {
+        socket.emit('error', 'O 7 do trunfo não pode ser o último jogado na rodada!');
+        return;
+      }
+      if (hasTrumpAce) {
+        io.to(roomId).emit('trump_ace_reveal', { userId, nickname: game.nicknames[userId] });
+      }
+    }
+
+    // --- Marcar 7 do trunfo jogado + revelar Ás se tiver na mão ---
     if (card.suit === state.trumpSuit && card.value === '7') {
       game.sevenTrumpPlayed = true;
+      const hasTrumpAce = player.hand.some((c, i) => i !== cardIdx && c.suit === state.trumpSuit && c.value === 'A');
+      if (hasTrumpAce) {
+        io.to(roomId).emit('trump_ace_reveal', { userId, nickname: game.nicknames[userId] });
+      }
     }
 
     player.hand.splice(cardIdx, 1);
@@ -858,73 +878,81 @@ io.on('connection', (socket: any) => {
       const winnerId = BiscaEngine.resolveVaza(state.vaza, state.trumpSuit!);
       state.lastVazaWinner = winnerId;
       state.currentTurn = winnerId;
-
       const vazaCards = state.vaza.map(v => v.card);
 
-      const sevenIdx = state.vaza.findIndex(v => v.card.suit === state.trumpSuit && v.card.value === '7');
-      const aceIdx = state.vaza.findIndex(v => v.card.suit === state.trumpSuit && v.card.value === 'A');
-      if (sevenIdx !== -1 && aceIdx !== -1 && aceIdx > sevenIdx) {
+      // --- HELAY: 7 e Ás do trunfo na mesma vaza, Ás DEPOIS do 7, times DIFERENTES ---
+      const sevenEntry = state.vaza.find(v => v.card.suit === state.trumpSuit && v.card.value === '7');
+      const aceEntry   = state.vaza.find(v => v.card.suit === state.trumpSuit && v.card.value === 'A');
+      const sevenPos   = state.vaza.findIndex(v => v.card.suit === state.trumpSuit && v.card.value === '7');
+      const acePos     = state.vaza.findIndex(v => v.card.suit === state.trumpSuit && v.card.value === 'A');
+      if (sevenEntry && aceEntry && acePos > sevenPos &&
+          state.players[sevenEntry.userId].team !== state.players[aceEntry.userId].team) {
         state.heleyOccurred = true;
         const heleyPoints = state.isCopas ? 2 : 1;
-        if (state.players[winnerId].team === 1) state.gameScore.team1 += heleyPoints;
+        const aceTeam = state.players[aceEntry.userId].team as 1 | 2;
+        if (aceTeam === 1) state.gameScore.team1 += heleyPoints;
         else state.gameScore.team2 += heleyPoints;
-        io.to(roomId).emit('heley_notice', { team: state.players[winnerId].team, points: heleyPoints });
+        io.to(roomId).emit('heley_notice', { team: aceTeam, points: heleyPoints });
       }
 
       state.players[winnerId].vazaPoints += BiscaEngine.calculateHandPoints(vazaCards);
 
+      // Emite vaza resolvida + estado (cartas ficam na mesa 2.5s antes de sair)
       io.to(roomId).emit('vaza_resolved', { winnerId, vaza: state.vaza });
-      state.vaza = [];
-      state.roundCount++;
+      io.to(roomId).emit('game_update', state);
 
-      if (state.deck.length > 0) {
-        const order = [];
-        const winIdx = game.slots.indexOf(winnerId);
-        for (let i = 0; i < 4; i++) {
-          order.push(game.slots[(winIdx + i) % 4]);
-        }
-        for (const pid of order) {
-          if (state.deck.length > 0) {
-            state.players[pid as string].hand.push(state.deck.pop()!);
+      setTimeout(() => {
+        if (!activeGames[roomId] || !activeGames[roomId].gameState) return;
+        const g = activeGames[roomId];
+        const s = g.gameState;
+
+        s.vaza = [];
+        s.roundCount++;
+
+        // Comprar cartas (vencedor primeiro)
+        if (s.deck.length > 0) {
+          const winIdx = g.slots.indexOf(winnerId);
+          for (let i = 0; i < 4; i++) {
+            if (s.deck.length > 0) {
+              s.players[g.slots[(winIdx + i) % 4] as string].hand.push(s.deck.pop()!);
+            }
           }
         }
-      }
 
-      if (state.players[userId].hand.length === 0 && state.deck.length === 0) {
-        const team1Points = Object.values(state.players).filter(p => p.team === 1).reduce((a, b) => a + b.vazaPoints, 0);
-        const team2Points = Object.values(state.players).filter(p => p.team === 2).reduce((a, b) => a + b.vazaPoints, 0);
+        // Checar fim de mão (todos sem cartas + baralho vazio)
+        const handsEmpty = Object.values(s.players).every(p => p.hand.length === 0);
+        if (handsEmpty && s.deck.length === 0) {
+          const t1Pts = (Object.values(s.players) as any[]).filter(p => p.team === 1).reduce((a: number, b: any) => a + b.vazaPoints, 0);
+          const t2Pts = (Object.values(s.players) as any[]).filter(p => p.team === 2).reduce((a: number, b: any) => a + b.vazaPoints, 0);
+          const handWinner: 1 | 2 = t1Pts >= t2Pts ? 1 : 2;
+          const loserPts = handWinner === 1 ? t2Pts : t1Pts;
+          const isCapote = loserPts <= 30;
+          let pts = s.isCopas ? 2 : 1;
+          if (isCapote) pts = s.isCopas ? 3 : 2;
+          if (handWinner === 1) s.gameScore.team1 += pts;
+          else s.gameScore.team2 += pts;
 
-        let winnerTeam: 1 | 2 = team1Points > team2Points ? 1 : 2;
-        let pointsWon = state.isCopas ? 2 : 1;
+          io.to(roomId).emit('hand_finished', {
+            team1Points: t1Pts, team2Points: t2Pts,
+            winnerTeam: handWinner, pointsWon: pts,
+            newGameScore: s.gameScore, isCopas: s.isCopas, isCapote
+          });
+          io.to(roomId).emit('game_update', s);
 
-        const loserPoints = winnerTeam === 1 ? team2Points : team1Points;
-        if (loserPoints <= 30) {
-          pointsWon = state.isCopas ? 3 : 2;
-          io.to(roomId).emit('system_message', `CAPOTE! A dupla perdedora fez apenas ${loserPoints} pontos.`);
-        }
-
-        if (winnerTeam === 1) state.gameScore.team1 += pointsWon;
-        else state.gameScore.team2 += pointsWon;
-
-        io.to(roomId).emit('hand_finished', {
-          team1Points,
-          team2Points,
-          winnerTeam,
-          pointsWon,
-          newGameScore: state.gameScore
-        });
-
-        if (state.gameScore.team1 >= game.config.scoreGoal || state.gameScore.team2 >= game.config.scoreGoal) {
-          state.status = 'FINISHED';
-          const winnerTeam: 1 | 2 = state.gameScore.team1 >= game.config.scoreGoal ? 1 : 2;
-          const loserTeam: 1 | 2 = winnerTeam === 1 ? 2 : 1;
-          try { db.prepare('UPDATE rooms SET status = ? WHERE id = ?').run('FINISHED', roomId); } catch {}
-          io.to(roomId).emit('game_finished', { winnerTeam });
-          doQueueSwap(roomId, loserTeam);
+          if (s.gameScore.team1 >= g.config.scoreGoal || s.gameScore.team2 >= g.config.scoreGoal) {
+            s.status = 'FINISHED';
+            const matchWinner: 1 | 2 = s.gameScore.team1 >= g.config.scoreGoal ? 1 : 2;
+            try { db.prepare('UPDATE rooms SET status = ? WHERE id = ?').run('FINISHED', roomId); } catch {}
+            io.to(roomId).emit('game_finished', { winnerTeam: matchWinner });
+            doQueueSwap(roomId, matchWinner === 1 ? 2 : 1);
+          } else {
+            setTimeout(() => triggerNextHand(roomId), 9000); // Tempo para modal de pontuação
+          }
         } else {
-          setTimeout(() => triggerNextHand(roomId), 5000);
+          io.to(roomId).emit('game_update', s);
         }
-      }
+      }, 2500);
+      return; // game_update já foi emitido acima
     }
 
     io.to(roomId).emit('game_update', state);
