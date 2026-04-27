@@ -242,13 +242,41 @@ export default function GameRoom() {
           <p className="text-[9px] text-slate-500 font-bold uppercase tracking-widest mt-0.5">Sala: {currentRoomId?.slice(0,8)}</p>
         </div>
 
-        {/* Placar */}
+        {/* Placar + Duplas unificado */}
         <div className="bg-slate-900 rounded-lg p-3 border-l-4 border-blue-500">
-          <p className="text-[9px] uppercase text-slate-500 font-bold tracking-wider mb-1">Placar da Partida</p>
-          <div className="flex justify-between items-end">
-            <div><span className="text-[9px] block text-blue-400 font-bold">Dupla 1</span><span className="text-2xl font-bold text-white">{gameState?.gameScore.team1 || 0}</span></div>
-            <span className="text-slate-600 mb-1 font-bold text-sm">vs</span>
-            <div className="text-right"><span className="text-[9px] block text-orange-400 font-bold">Dupla 2</span><span className="text-2xl font-bold text-white">{gameState?.gameScore.team2 || 0}</span></div>
+          <p className="text-[9px] uppercase text-slate-500 font-bold tracking-wider mb-2">Placar da Partida</p>
+
+          {/* Duplas com membros */}
+          <div className="flex gap-1.5 mb-3">
+            {([1, 2] as const).map(team => {
+              const members = roomData.slots.filter(uid => uid && roomData.teams[uid] === team);
+              const tc = TEAM_COLORS[team];
+              return (
+                <div key={team} className={`flex-1 rounded-lg px-2 py-1.5 border ${tc.bg}`}
+                  style={{ borderColor: team === 1 ? '#3b82f6' : '#f97316', borderWidth: 1 }}>
+                  <span className={`text-[8px] font-black uppercase tracking-widest ${tc.text}`}>{tc.label}</span>
+                  <div className="mt-1 space-y-0.5">
+                    {members.length === 0 ? (
+                      <span className="text-[8px] text-slate-600 italic">aguardando...</span>
+                    ) : members.map(uid => (
+                      <div key={uid} className="flex items-center gap-1">
+                        <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${tc.dot}`} />
+                        <span className={`text-[8px] font-bold truncate leading-tight ${uid === user?.id ? tc.text : 'text-slate-300'}`}>
+                          {roomData.nicknames[uid!] || '?'}{uid === user?.id ? ' (você)' : ''}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Placar numérico */}
+          <div className="flex justify-between items-center px-1">
+            <span className="text-2xl font-bold text-white">{gameState?.gameScore.team1 || 0}</span>
+            <span className="text-slate-600 font-bold text-xs">vs</span>
+            <span className="text-2xl font-bold text-white">{gameState?.gameScore.team2 || 0}</span>
           </div>
           <p className="text-[9px] text-center mt-2 text-blue-300 font-bold uppercase tracking-widest bg-blue-500/10 py-1 rounded">Meta: {config?.scoreGoal || 5} pts</p>
         </div>
@@ -270,34 +298,6 @@ export default function GameRoom() {
                 {gameState.isCopas ? 'COPAS' : 'NORMAL'}
               </span>
             </div>
-          </div>
-        )}
-
-        {/* Duplas */}
-        {roomData.slots.some(s => s !== null) && (
-          <div className="bg-slate-900 rounded-lg p-3 space-y-2">
-            <p className="text-[9px] uppercase text-slate-500 font-bold tracking-wider">Duplas</p>
-            {([1, 2] as const).map(team => {
-              const members = roomData.slots.filter(uid => uid && roomData.teams[uid] === team);
-              const tc = TEAM_COLORS[team];
-              return (
-                <div key={team} className={`rounded-lg px-2 py-1.5 border ${tc.bg} border-opacity-30`} style={{ borderColor: team === 1 ? '#3b82f6' : '#f97316' }}>
-                  <span className={`text-[8px] font-black uppercase tracking-widest ${tc.text}`}>{tc.label}</span>
-                  <div className="mt-1 space-y-0.5">
-                    {members.length === 0 ? (
-                      <span className="text-[9px] text-slate-600 italic">aguardando...</span>
-                    ) : members.map(uid => (
-                      <div key={uid} className="flex items-center gap-1.5">
-                        <div className={`w-1.5 h-1.5 rounded-full ${tc.dot}`} />
-                        <span className={`text-[9px] font-bold truncate ${uid === user?.id ? tc.text : 'text-slate-300'}`}>
-                          {roomData.nicknames[uid!] || '?'}{uid === user?.id ? ' (você)' : ''}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              );
-            })}
           </div>
         )}
 
