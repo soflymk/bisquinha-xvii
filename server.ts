@@ -44,15 +44,20 @@ console.log("Cleaning up orphaned rooms...");
 db.prepare("DELETE FROM rooms WHERE status != 'FINISHED'").run();
 
 // Admin padrão
+// A senha pode ser definida via variável de ambiente ADMIN_PASSWORD.
+// Se não fornecida, usa 'admin123'. Para alterar no Render: Dashboard → Environment → ADMIN_PASSWORD.
 const adminId = 'admin-uuid';
-const adminRow = db.prepare('SELECT id FROM users WHERE username = ?').get('admin');
+const adminPassword = process.env.ADMIN_PASSWORD || 'admin123';
+const adminRow = db.prepare('SELECT id FROM users WHERE username = ?').get('admin') as any;
 if (!adminRow) {
   console.log("Creating default admin user...");
-  const hash = bcrypt.hashSync('admin123', 10);
+  const hash = bcrypt.hashSync(adminPassword, 10);
   db.prepare('INSERT INTO users (id, username, password_hash, nickname, role, is_active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
     .run(adminId, 'admin', hash, 'Administrador', 'ADMIN', 1, Date.now());
   console.log("Admin user created.");
 } else {
+  // Garante que o role e is_active do admin estejam corretos (proteção contra corrupção de dados).
+  db.prepare("UPDATE users SET role = 'ADMIN', is_active = 1 WHERE username = 'admin'").run();
   console.log("Admin user already exists.");
 }
 
@@ -64,6 +69,10 @@ const io = new Server(httpServer, {
     credentials: true
   }
 });
+
+// Necessário para que o Express confie no proxy HTTPS do Render (e outros PaaS).
+// Sem isso, req.secure = false → express-session não envia o Set-Cookie com secure:true.
+app.set('trust proxy', 1);
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
