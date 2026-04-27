@@ -3,6 +3,7 @@ import { createServer } from 'http';
 import { Server } from 'socket.io';
 import path from 'path';
 import session from 'express-session';
+import ConnectSQLite from 'connect-sqlite3';
 import cookieParser from 'cookie-parser';
 import bcrypt from 'bcryptjs';
 import { v4 as uuidv4 } from 'uuid';
@@ -10,9 +11,14 @@ import sqlite3 from 'sqlite3';
 import { BiscaEngine } from './src/lib/engine';
 import { Card, GameState, RoomStatus, User, Suit, ChatMessage } from './src/lib/types';
 
+const SQLiteStore = ConnectSQLite(session);
+
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'bisca.db');
+
 // Database Setup
-console.log("Initializing database...");
-const db = new sqlite3.Database('bisca.db', (err) => {
+console.log(`Initializing database at: ${DB_PATH}`);
+const db = new sqlite3.Database(DB_PATH, (err) => {
   if (err) console.error("Database open error:", err);
   else console.log("Database opened successfully");
 });
@@ -67,9 +73,9 @@ const app = express();
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: {
-  origin: true,
-  credentials: true
-}
+    origin: true,
+    credentials: true
+  }
 });
 
 app.use(express.json());
@@ -77,10 +83,16 @@ app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
 const sessionMiddleware = session({
-  secret: 'bisca-secret-key-capixaba',
+  store: new SQLiteStore({ db: 'sessions.db', dir: path.dirname(DB_PATH) }) as any,
+  secret: process.env.SESSION_SECRET || 'bisca-secret-key-dev-change-in-production',
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: false, maxAge: 24 * 60 * 60 * 1000 }
+  cookie: {
+    secure: IS_PRODUCTION,
+    httpOnly: true,
+    sameSite: IS_PRODUCTION ? 'none' : 'lax',
+    maxAge: 24 * 60 * 60 * 1000
+  }
 });
 
 app.use(sessionMiddleware);

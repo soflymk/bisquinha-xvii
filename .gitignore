@@ -7,3 +7,7 @@ coverage/
 .env*
 !.env.example
 .claude
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
