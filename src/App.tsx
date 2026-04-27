@@ -179,7 +179,7 @@ export default function App() {
           </nav>
         )}
 
-        <main className={`flex-1 overflow-hidden ${view === 'GAME' ? 'p-0' : 'container mx-auto p-4 md:p-8'}`}>
+        <main className={`flex-1 ${view === 'GAME' ? 'overflow-hidden p-0' : 'overflow-y-auto container mx-auto p-4 md:p-8'}`}>
           <AnimatePresence mode="wait">
              {view === 'LOGIN' && <Login key="login" />}
              {view === 'LOBBY' && <Lobby key="lobby" />}
