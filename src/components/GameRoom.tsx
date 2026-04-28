@@ -58,8 +58,15 @@ export default function GameRoom() {
     newGameScore: { team1: number; team2: number };
     isCopas: boolean; isCapote: boolean;
   } | null>(null);
-  // Novo: revelação do Ás do trunfo
+  // Novo: revelação do Ás do trunfo (banner simples)
   const [aceReveal, setAceReveal] = useState<{ nickname: string } | null>(null);
+  // Novo: prompt de troca do 2 do corte
+  const [trumpTwoPrompt, setTrumpTwoPrompt] = useState<{ corteCard: Card; twoCard: Card } | null>(null);
+  const [swapPhase, setSwapPhase] = useState<'prompt' | 'animating' | null>(null);
+  // Novo: revelação especial do Ás quando 7 sai de fundo
+  const [sevenFundoReveal, setSevenFundoReveal] = useState<{ aceCard: Card; nickname: string; phase: 'show' | 'hide' } | null>(null);
+  // Fila de espectadores (visibilidade do painel flutuante)
+  const [showSpecQueue, setShowSpecQueue] = useState(false);
 
   // Ref para roomData dentro de callbacks de socket (evita stale closure)
   const roomDataRef = useRef(roomData);
@@ -95,7 +102,13 @@ export default function GameRoom() {
 
     socket.on('room_update', (data: any) => setRoomData(prev => ({ ...prev, ...data })));
     socket.on('game_started', (state: GameState) => { setGameState(state); setSysMsg('A partida começou!'); });
-    socket.on('game_update', (state: GameState) => setGameState(state));
+    socket.on('game_update', (state: GameState) => {
+      setGameState(state);
+      if (state.corteSwapDone || state.roundCount > 0) {
+        setTrumpTwoPrompt(null);
+        setSwapPhase(null);
+      }
+    });
 
     socket.on('vaza_resolved', ({ winnerId }: { winnerId: string }) => {
       const rd = roomDataRef.current;
@@ -141,10 +154,25 @@ export default function GameRoom() {
       setTimeout(() => setGameError(null), 3000);
     });
 
-    // Revelação do Ás do trunfo
+    // Revelação do Ás do trunfo (banner simples — quando 7 jogado sem ser fundo)
     socket.on('trump_ace_reveal', ({ nickname }: { nickname: string }) => {
       setAceReveal({ nickname });
       setTimeout(() => setAceReveal(null), 3000);
+    });
+
+    // 2 do corte disponível para troca
+    socket.on('trump_two_available', (data: any) => {
+      setTrumpTwoPrompt({ corteCard: data.corteCard, twoCard: data.twoCard });
+      setSwapPhase('prompt');
+    });
+
+    // 7 de fundo: revelação dramática do Ás
+    socket.on('trump_seven_fundo_ace_reveal', (data: any) => {
+      setSevenFundoReveal({ aceCard: data.aceCard, nickname: data.nickname, phase: 'show' });
+      setTimeout(() => {
+        setSevenFundoReveal(prev => prev ? { ...prev, phase: 'hide' } : null);
+        setTimeout(() => setSevenFundoReveal(null), 700);
+      }, 1800);
     });
 
     return () => {
@@ -152,7 +180,8 @@ export default function GameRoom() {
        'hand_finished','game_finished','system_message','game_aborted','error',
        'swap_request_received','queue_updated','spectator_choose_replacement',
        'kick_vote_started','kick_vote_update','kick_vote_result','kicked_from_room',
-       'player_disconnected','player_reconnected','trump_ace_reveal'
+       'player_disconnected','player_reconnected','trump_ace_reveal',
+       'trump_two_available','trump_seven_fundo_ace_reveal'
       ].forEach(ev => socket.off(ev));
     };
   }, [socket, currentRoomId, user?.id]);
@@ -200,6 +229,14 @@ export default function GameRoom() {
   const startGame = () => socket?.emit('start_game', currentRoomId);
   const playCard = (cardId: string) => { if (gameState?.currentTurn !== user?.id) return; socket?.emit('play_card', { roomId: currentRoomId, cardId }); };
   const swap2Corte = () => socket?.emit('swap_corte_2', currentRoomId);
+  const performTwoSwap = () => {
+    setSwapPhase('animating');
+    setTimeout(() => {
+      socket?.emit('swap_corte_2', currentRoomId);
+      setTrumpTwoPrompt(null);
+      setSwapPhase(null);
+    }, 1800);
+  };
   const selectCorte = (cardId?: string, isBater?: boolean) => { setPendingCorte(true); socket?.emit('select_corte', { roomId: currentRoomId, cardId, isBater }); };
   const sendChat = (e: React.FormEvent) => { e.preventDefault(); if (!chatInput.trim()) return; socket?.emit('send_chat', { roomId: currentRoomId, text: chatInput }); setChatInput(''); };
   const initiateKick = (targetId: string) => socket?.emit('initiate_kick', { roomId: currentRoomId, targetId });
@@ -301,21 +338,6 @@ export default function GameRoom() {
           </div>
         )}
 
-        {/* Fila de espera */}
-        {roomData.spectators.length > 0 && (
-          <div className="bg-slate-900 rounded-lg p-3 border-l-4 border-amber-500">
-            <p className="text-[9px] uppercase text-slate-500 font-bold tracking-wider mb-1">Fila de Espera</p>
-            <div className="space-y-1">
-              {roomData.spectators.map((s, i) => (
-                <div key={s.userId} className="flex items-center gap-1.5">
-                  <span className="text-[8px] font-black text-amber-500 w-4">#{i+1}</span>
-                  <span className={`text-[9px] font-bold truncate flex-1 ${s.userId === user?.id ? 'text-amber-300' : 'text-slate-400'}`}>{s.nickname}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
         {/* Chat */}
         <div className="flex-1 flex flex-col min-h-0 bg-slate-900/50 rounded-xl border border-white/5 overflow-hidden">
           <div className="p-2 border-b border-white/5 flex items-center gap-2 shrink-0">
@@ -386,18 +408,6 @@ export default function GameRoom() {
           <button onClick={() => setShowChatMb(true)} className="p-1.5 text-slate-500 hover:text-white"><MessageSquare size={18} /></button>
         </div>
 
-        {/* Fila mobile */}
-        {roomData.spectators.length > 0 && (
-          <div className="lg:hidden flex items-center gap-2 px-3 py-1 bg-amber-900/20 border-b border-amber-800/30 overflow-x-auto shrink-0">
-            <span className="text-[8px] font-black text-amber-600 uppercase shrink-0">Fila:</span>
-            {roomData.spectators.map((s, i) => (
-              <span key={s.userId} className={`text-[9px] font-bold px-2 py-0.5 rounded-full shrink-0 ${s.userId === user?.id ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40' : 'text-slate-400'}`}>
-                #{i+1} {s.nickname}
-              </span>
-            ))}
-          </div>
-        )}
-
         {/* Mesa de Jogo */}
         <div className="flex-1 flex flex-col justify-center items-center relative overflow-hidden p-2 md:p-6">
           <div className="game-table relative w-[95%] h-[95%] max-w-[800px] max-h-[480px] flex items-center justify-center" style={{
@@ -431,6 +441,42 @@ export default function GameRoom() {
                 />
               );
             })}
+
+            {/* Fila de espectadores — olho flutuante, canto inferior-esquerdo */}
+            {roomData.spectators.length > 0 && (
+              <div className="absolute bottom-2 left-3 z-40">
+                <AnimatePresence>
+                  {showSpecQueue && (
+                    <motion.div
+                      initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                      animate={{ opacity: 1, y: 0, scale: 1 }}
+                      exit={{ opacity: 0, y: 10, scale: 0.95 }}
+                      className="absolute bottom-8 left-0 bg-slate-900/95 border border-amber-500/40 rounded-xl p-3 w-44 shadow-2xl backdrop-blur-sm"
+                    >
+                      <div className="flex justify-between items-center mb-2">
+                        <span className="text-[8px] font-black text-amber-500 uppercase tracking-widest">Fila de Espera</span>
+                        <button onClick={() => setShowSpecQueue(false)} className="text-slate-500 hover:text-white"><X size={10} /></button>
+                      </div>
+                      <div className="space-y-1">
+                        {roomData.spectators.map((s, i) => (
+                          <div key={s.userId} className="flex items-center gap-1.5">
+                            <span className="text-[8px] font-black text-amber-500 w-4">#{i+1}</span>
+                            <span className={`text-[8px] font-bold truncate ${s.userId === user?.id ? 'text-amber-300' : 'text-slate-400'}`}>{s.nickname}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+                <button
+                  onClick={() => setShowSpecQueue(v => !v)}
+                  className="flex items-center gap-1 bg-amber-900/60 hover:bg-amber-800/80 border border-amber-500/40 text-amber-400 rounded-full px-2 py-1 text-[8px] font-black shadow-lg transition"
+                >
+                  <span>👁</span>
+                  <span>{roomData.spectators.length}</span>
+                </button>
+              </div>
+            )}
 
             {/* Monte da Minha Dupla — canto inferior-esquerdo */}
             {myTeamCardCount > 0 && (
@@ -570,9 +616,9 @@ export default function GameRoom() {
                     {['IN_GAME', 'DEALING'].includes(gameState.status) && (
                       <motion.div initial={{ opacity:0, scale:0.8 }} animate={{ opacity:1, scale:1 }}
                         className="absolute left-[-150px] md:left-[-250px] flex items-center justify-center">
-                        {/* Carta do corte (só mostra se não for copas e tiver carta) */}
+                        {/* Carta do corte — 1/3 sob o baralho, 2/3 exposta à direita */}
                         {!gameState.isCopas && gameState.visibleCorte && (
-                          <div className={`absolute rotate-90 ${gameState.status === 'IN_GAME' ? 'translate-x-8' : ''}`}>
+                          <div className={`absolute rotate-90 transition-all duration-500 ${gameState.status === 'IN_GAME' ? 'translate-x-[52px] md:translate-x-[60px]' : 'translate-x-2'}`}>
                             <GameCard card={gameState.visibleCorte} size="md" isCorte />
                           </div>
                         )}
@@ -781,6 +827,102 @@ export default function GameRoom() {
                   className="flex-1 bg-slate-800 border-none rounded-2xl px-5 py-3 text-white focus:ring-2 focus:ring-blue-500 font-bold placeholder:text-slate-600" />
                 <button type="submit" className="shrink-0 bg-blue-600 hover:bg-blue-500 text-white p-4 rounded-2xl active:scale-95"><Send size={20} /></button>
               </form>
+            </div>
+          )}
+        </AnimatePresence>
+
+        {/* Revelação dramática do Ás — 7 de fundo */}
+        <AnimatePresence>
+          {sevenFundoReveal && (
+            <motion.div
+              className="absolute inset-0 flex flex-col items-center justify-center z-[260] pointer-events-none"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+            >
+              <div className="bg-black/60 backdrop-blur-sm absolute inset-0" />
+              <motion.div
+                className="relative z-10 flex flex-col items-center gap-3"
+                initial={{ scale: 0.3, y: 60 }}
+                animate={sevenFundoReveal.phase === 'show'
+                  ? { scale: 2.2, y: 0 }
+                  : { scale: 0.4, y: 80, opacity: 0 }}
+                transition={{ type: 'spring', damping: 18, stiffness: 220 }}
+              >
+                <GameCard card={sevenFundoReveal.aceCard} size="lg" />
+              </motion.div>
+              <motion.p
+                initial={{ opacity: 0, y: 20 }}
+                animate={sevenFundoReveal.phase === 'show' ? { opacity: 1, y: 0 } : { opacity: 0 }}
+                className="relative z-10 mt-8 text-white font-black text-xs uppercase tracking-widest bg-purple-800/90 px-4 py-2 rounded-full border border-purple-400/50"
+              >
+                {sevenFundoReveal.nickname} tem o Ás do corte!
+              </motion.p>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Modal: troca do 2 do corte */}
+        <AnimatePresence>
+          {trumpTwoPrompt && swapPhase && (
+            <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-md flex items-center justify-center z-[270] p-4">
+              <motion.div
+                initial={{ scale: 0.85, opacity: 0 }}
+                animate={{ scale: 1, opacity: 1 }}
+                exit={{ scale: 0.85, opacity: 0 }}
+                className="bg-slate-800 border-2 border-yellow-500/60 p-6 rounded-[2rem] shadow-2xl max-w-xs w-full text-center"
+              >
+                <div className="text-2xl mb-1">🔄</div>
+                <h4 className="text-sm font-black text-white uppercase mb-1">Você tem o 2 do corte!</h4>
+                <p className="text-slate-400 text-[9px] mb-4">Quer trocar pelo <span className="text-yellow-300 font-bold">{trumpTwoPrompt.corteCard.value} de {trumpTwoPrompt.corteCard.suit}</span>?</p>
+
+                {/* Animação das cartas */}
+                <div className="flex items-center justify-center gap-4 my-4">
+                  <motion.div
+                    animate={swapPhase === 'animating' ? { x: 80, opacity: 0, scale: 0.5 } : { x: 0, opacity: 1, scale: 1 }}
+                    transition={{ duration: 0.5 }}
+                    className="flex flex-col items-center gap-1"
+                  >
+                    <GameCard card={trumpTwoPrompt.twoCard} size="sm" />
+                    <span className="text-[7px] text-slate-400 font-bold">sua mão</span>
+                  </motion.div>
+
+                  <motion.div
+                    animate={swapPhase === 'animating' ? { rotate: [0, 15, -15, 0], scale: [1, 1.2, 1] } : {}}
+                    transition={{ duration: 0.6 }}
+                    className="text-yellow-400 font-black text-lg"
+                  >⇄</motion.div>
+
+                  <motion.div
+                    animate={swapPhase === 'animating' ? { x: -80, opacity: 0, scale: 0.5 } : { x: 0, opacity: 1, scale: 1 }}
+                    transition={{ duration: 0.5 }}
+                    className="flex flex-col items-center gap-1"
+                  >
+                    <GameCard card={trumpTwoPrompt.corteCard} size="sm" />
+                    <span className="text-[7px] text-yellow-500 font-bold">corte</span>
+                  </motion.div>
+                </div>
+
+                {swapPhase === 'prompt' && (
+                  <div className="flex gap-3 mt-2">
+                    <button
+                      onClick={() => { setTrumpTwoPrompt(null); setSwapPhase(null); }}
+                      className="flex-1 py-2 bg-slate-700 hover:bg-slate-600 rounded-xl font-black text-slate-300 text-xs uppercase transition"
+                    >
+                      Manter
+                    </button>
+                    <button
+                      onClick={performTwoSwap}
+                      className="flex-1 py-2 bg-yellow-600 hover:bg-yellow-500 rounded-xl font-black text-white text-xs uppercase transition"
+                    >
+                      Trocar!
+                    </button>
+                  </div>
+                )}
+                {swapPhase === 'animating' && (
+                  <p className="text-yellow-400 text-[9px] font-black uppercase animate-pulse mt-2">Trocando...</p>
+                )}
+              </motion.div>
             </div>
           )}
         </AnimatePresence>

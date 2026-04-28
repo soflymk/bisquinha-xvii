@@ -574,6 +574,19 @@ io.on('connection', (socket: any) => {
             currState.currentTurn = g2.slots[startIdx]!;
             io.to(roomId).emit('game_update', currState);
             io.to(roomId).emit('system_message', `Cartas dadas! Começa ${g2.nicknames[currState.currentTurn]}.`);
+            // Notificar player que tem o 2 do corte (pode trocar na 1ª rodada)
+            if (currState.visibleCorte && !currState.isCopas && !currState.corteSwapDone) {
+              const corteSuit = currState.visibleCorte.suit;
+              for (const pid of g2.slots) {
+                if (!pid) continue;
+                const twoCard = currState.players[pid].hand.find(c => c.value === '2' && c.suit === corteSuit);
+                if (twoCard) {
+                  const sid = userSockets[pid];
+                  if (sid) io.to(sid).emit('trump_two_available', { corteCard: currState.visibleCorte, twoCard });
+                  break;
+                }
+              }
+            }
           }
         }, 400);
       }, 400);
@@ -845,25 +858,26 @@ io.on('connection', (socket: any) => {
       }
     }
 
-    // --- REGRA: 7 do trunfo não pode sair de fundo (último a jogar) ---
-    // Exceção: baralho vazio OU tem o Ás do trunfo na mão (revela que tem o Ás)
+    // --- REGRA: 7 do corte não pode sair de fundo (último da rodada) ---
+    // Exceção: baralho vazio OU tem o Ás do corte na mão (animação especial de revelação)
+    // Outros 7 e ÁS (de outros naipes) podem ser jogados normalmente.
+    let sevenFundoAceCard: Card | null = null;
     if (card.suit === state.trumpSuit && card.value === '7' && state.vaza.length === 3) {
-      const hasTrumpAce = player.hand.some((c, i) => i !== cardIdx && c.suit === state.trumpSuit && c.value === 'A');
-      if (state.deck.length > 0 && !hasTrumpAce) {
-        socket.emit('error', 'O 7 do trunfo não pode ser o último jogado na rodada!');
+      const aceEntry = player.hand.find((c, i) => i !== cardIdx && c.suit === state.trumpSuit && c.value === 'A');
+      if (state.deck.length > 0 && !aceEntry) {
+        socket.emit('error', 'O 7 do corte não pode ser o último jogado na rodada!');
         return;
       }
-      if (hasTrumpAce) {
-        io.to(roomId).emit('trump_ace_reveal', { userId, nickname: game.nicknames[userId] });
-      }
+      if (aceEntry) sevenFundoAceCard = aceEntry; // revelado após a vaza
     }
 
-    // --- Marcar 7 do trunfo jogado + revelar Ás se tiver na mão ---
+    // --- Marcar 7 do corte jogado + revelar Ás se NÃO for fundo ---
     if (card.suit === state.trumpSuit && card.value === '7') {
       game.sevenTrumpPlayed = true;
-      const hasTrumpAce = player.hand.some((c, i) => i !== cardIdx && c.suit === state.trumpSuit && c.value === 'A');
-      if (hasTrumpAce) {
-        io.to(roomId).emit('trump_ace_reveal', { userId, nickname: game.nicknames[userId] });
+      if (!sevenFundoAceCard) {
+        // fundo trata a revelação com animação especial; aqui só o caso normal
+        const hasTrumpAce = player.hand.some((c, i) => i !== cardIdx && c.suit === state.trumpSuit && c.value === 'A');
+        if (hasTrumpAce) io.to(roomId).emit('trump_ace_reveal', { userId, nickname: game.nicknames[userId] });
       }
     }
 
@@ -897,9 +911,21 @@ io.on('connection', (socket: any) => {
 
       state.players[winnerId].vazaPoints += BiscaEngine.calculateHandPoints(vazaCards);
 
-      // Emite vaza resolvida + estado (cartas ficam na mesa 2.5s antes de sair)
+      // Emite vaza resolvida + estado (cartas ficam visíveis antes de sair)
       io.to(roomId).emit('vaza_resolved', { winnerId, vaza: state.vaza });
       io.to(roomId).emit('game_update', state);
+
+      // 7 de fundo com Ás: revela o Ás com animação após as cartas estarem na mesa
+      if (sevenFundoAceCard) {
+        const capturedAce = sevenFundoAceCard;
+        setTimeout(() => {
+          if (activeGames[roomId]) {
+            io.to(roomId).emit('trump_seven_fundo_ace_reveal', {
+              userId, nickname: game.nicknames[userId], aceCard: capturedAce
+            });
+          }
+        }, 700);
+      }
 
       setTimeout(() => {
         if (!activeGames[roomId] || !activeGames[roomId].gameState) return;
@@ -951,7 +977,7 @@ io.on('connection', (socket: any) => {
         } else {
           io.to(roomId).emit('game_update', s);
         }
-      }, 2500);
+      }, sevenFundoAceCard ? 4500 : 2500);
       return; // game_update já foi emitido acima
     }
 
