@@ -102,7 +102,7 @@ export default function App() {
               </button>
               
               <h1 className="text-lg md:text-xl font-bold tracking-tighter text-orange-500 flex items-center gap-2">
-                 BISCA <span className="text-white hidden sm:inline">CAPIXABA</span>
+                 BISQUINHA <span className="text-white hidden sm:inline">CFO XVII</span>
               </h1>
               
               <div className="hidden md:flex gap-4">

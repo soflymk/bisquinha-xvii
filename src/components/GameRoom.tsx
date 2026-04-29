@@ -275,7 +275,7 @@ export default function GameRoom() {
       {/* ── Sidebar Desktop ── */}
       <aside className="hidden lg:flex w-60 bg-slate-800 border-r border-slate-700 p-4 flex-col shrink-0 gap-3">
         <div>
-          <h1 className="text-base font-bold text-blue-400">Bisca Capixaba</h1>
+          <h1 className="text-base font-bold text-blue-400">Bisquinha CFO XVII</h1>
           <p className="text-[9px] text-slate-500 font-bold uppercase tracking-widest mt-0.5">Sala: {currentRoomId?.slice(0,8)}</p>
         </div>
 
