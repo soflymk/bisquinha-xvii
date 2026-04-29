@@ -1,7 +1,7 @@
 import { useState, useEffect, FormEvent } from 'react';
 import { useApp } from '../App';
 import { motion, AnimatePresence } from 'motion/react';
-import { ShieldCheck, UserMinus, UserPlus, Search, Filter, Crown, Key, X } from 'lucide-react';
+import { ShieldCheck, UserMinus, UserPlus, Search, Crown, Key, X, Trash2 } from 'lucide-react';
 
 export default function Admin() {
   const [activeTab, setActiveTab] = useState<'USERS' | 'ROOMS'>('USERS');
@@ -97,6 +97,20 @@ export default function Admin() {
     } else {
       const data = await res.json();
       alert(data.error || 'Erro ao redefinir senha');
+    }
+  };
+
+  const deleteUser = async (userId: string, username: string) => {
+    if (!confirm(`Excluir permanentemente o usuário @${username}? Esta ação não pode ser desfeita.`)) return;
+    const res = await fetch('/api/admin/users/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId })
+    });
+    if (res.ok) fetchUsers();
+    else {
+      const data = await res.json();
+      alert(data.error || 'Erro ao excluir usuário');
     }
   };
 
@@ -236,13 +250,23 @@ export default function Admin() {
                             <Key size={18} />
                           </button>
 
-                          <button 
+                          <button
                             onClick={() => toggleUser(u.id, !!u.is_active)}
                             className={`p-3 transition rounded-xl border ${u.is_active ? 'text-red-400 border-red-500/20 hover:bg-red-500/10' : 'text-emerald-400 border-emerald-500/20 hover:bg-emerald-500/10'}`}
                             title={u.is_active ? 'Bloquear' : 'Desbloquear'}
                           >
                             {u.is_active ? <UserMinus size={18} /> : <UserPlus size={18} />}
                           </button>
+
+                          {u.id !== currentUser?.id && u.username !== 'admin' && (
+                            <button
+                              onClick={() => deleteUser(u.id, u.username)}
+                              className="p-3 transition rounded-xl border text-slate-600 border-slate-700/50 hover:text-red-400 hover:border-red-500/30 hover:bg-red-500/5"
+                              title="Excluir permanentemente"
+                            >
+                              <Trash2 size={18} />
+                            </button>
+                          )}
                         </div>
                       </td>
                     </tr>

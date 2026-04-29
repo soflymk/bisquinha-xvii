@@ -113,6 +113,7 @@ const activeGames: Record<string, {
   sevenTrumpPlayed: boolean;
   spectators: { userId: string; nickname: string }[];
   kickVote: { targetId: string; targetNickname: string; initiatorId: string; votes: string[]; timer: NodeJS.Timeout } | null;
+  lastRoundShareDone: boolean;
 }> = {};
 
 const cleanupRoom = (roomId: string, io: Server) => {
@@ -250,6 +251,19 @@ app.post('/api/admin/users/reset-password', (req: any, res) => {
   }
 });
 
+app.post('/api/admin/users/delete', (req: any, res) => {
+  if (req.session.role !== 'ADMIN') return res.status(403).json({ error: 'Acesso negado' });
+  const { userId } = req.body;
+  if (userId === 'admin-uuid') return res.status(400).json({ error: 'Não é possível excluir o administrador padrão.' });
+  if (userId === req.session.userId) return res.status(400).json({ error: 'Você não pode se excluir.' });
+  try {
+    db.prepare('DELETE FROM users WHERE id = ?').run(userId);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Erro ao excluir usuário' });
+  }
+});
+
 app.post('/api/me/change-password', (req: any, res) => {
   if (!req.session.userId) return res.status(401).json({ error: 'Não logado' });
   const { currentPassword, newPassword } = req.body;
@@ -359,7 +373,8 @@ app.post('/api/rooms/create', (req: any, res) => {
       chat: [],
       sevenTrumpPlayed: false,
       spectators: [],
-      kickVote: null
+      kickVote: null,
+      lastRoundShareDone: false
     };
 
     res.json({ roomId });
@@ -506,13 +521,15 @@ io.on('connection', (socket: any) => {
     } else {
       const card = state.cuttingCards.find(c => c.id === cardId);
       if (!card) return;
-      state.visibleCorte = card;
       state.trumpSuit = card.suit;
-
-      if (card.value === 'A' || card.value === '7') {
+      const isBisca = card.value === 'A' || card.value === '7';
+      if (isBisca) {
+        // Bisca: nipe invertido, carta NÃO fica exposta — volta ao baralho
         state.trumpSuit = BiscaEngine.getSuitInversion(card.suit);
+        state.visibleCorte = null;
+      } else {
+        state.visibleCorte = card;
       }
-
       io.to(roomId).emit('game_update', state);
     }
 
@@ -522,11 +539,14 @@ io.on('connection', (socket: any) => {
       const s = g.gameState;
 
       if (!s.isCopas) {
-        s.deck.push(...s.cuttingCards.filter(c => c.id !== cardId));
+        // Bisca (A ou 7 cortado): visibleCorte é null, carta retorna ao baralho (inclui cardId)
+        // Normal: visibleCorte está definido, cardId fica como corte exposto
+        const isBiscaMode = !s.visibleCorte;
+        s.deck.push(...s.cuttingCards.filter(c => isBiscaMode || c.id !== cardId));
         s.cuttingCards = [];
         s.deck = BiscaEngine.shuffle(s.deck);
-
-        if (s.visibleCorte && s.visibleCorte.value !== 'A' && s.visibleCorte.value !== '7') {
+        if (s.visibleCorte) {
+          // Coloca corte no fundo do baralho (index 0 = último a ser sacado com pop())
           const idx = s.deck.findIndex(c => c.id === s.visibleCorte!.id);
           if (idx !== -1) s.deck.splice(idx, 1);
           s.deck.unshift(s.visibleCorte);
@@ -607,6 +627,7 @@ io.on('connection', (socket: any) => {
     state.heleyOccurred = false;
     state.status = 'SHUFFLING';
     game.sevenTrumpPlayed = false;
+    game.lastRoundShareDone = false;
 
     for (const pid in state.players) {
       state.players[pid].hand = [];
@@ -848,13 +869,22 @@ io.on('connection', (socket: any) => {
 
     const card = player.hand[cardIdx];
 
-    // --- REGRA: Ás do trunfo antes do 7 ---
-    // Exceção: jogador tem AMBOS 7 e Ás na mão (pode jogar o Ás pois tem o 7)
+    // --- REGRA: Ás do corte antes do 7 do corte ---
+    // Exceção: jogador tem AMBOS (pode jogar o Ás; o 7 é revelado a todos)
     if (card.suit === state.trumpSuit && card.value === 'A' && !game.sevenTrumpPlayed && state.deck.length > 0) {
-      const hasTrumpSeven = player.hand.some((c, i) => i !== cardIdx && c.suit === state.trumpSuit && c.value === '7');
-      if (player.hand.length > 1 && !hasTrumpSeven) {
-        socket.emit('error', 'O Ás do trunfo não pode ser jogado antes do 7 do trunfo!');
+      const trumpSevenEntry = player.hand.find((c, i) => i !== cardIdx && c.suit === state.trumpSuit && c.value === '7');
+      if (player.hand.length > 1 && !trumpSevenEntry) {
+        socket.emit('error', 'O Ás do corte não pode ser jogado antes do 7 do corte!');
         return;
+      }
+      // Tem ambos: revela o 7 após o Ás se estabelecer na mesa (~1s)
+      if (trumpSevenEntry) {
+        const capturedSeven = trumpSevenEntry;
+        setTimeout(() => {
+          if (activeGames[roomId]) {
+            io.to(roomId).emit('trump_seven_reveal', { userId, nickname: game.nicknames[userId], sevenCard: capturedSeven });
+          }
+        }, 1000);
       }
     }
 
@@ -935,14 +965,67 @@ io.on('connection', (socket: any) => {
         s.vaza = [];
         s.roundCount++;
 
+        const winIdx = g.slots.indexOf(winnerId);
+        const deckBefore = s.deck.length;
+
+        // Animar distribuição pós-vaza (evento para o cliente)
+        if (deckBefore > 0) {
+          const dealCount = Math.min(deckBefore, 4);
+          const dealOrder = Array.from({ length: dealCount }, (_, i) => g.slots[(winIdx + i) % 4]);
+          io.to(roomId).emit('post_vaza_deal_sequence', { dealOrder });
+
+          // Carta do corte vai para um jogador? (está em deck[0] = última a ser sacada)
+          if (s.visibleCorte && s.deck[0]?.id === s.visibleCorte.id) {
+            const corteRecipIdx = (winIdx + dealCount - 1) % 4;
+            io.to(roomId).emit('corte_card_deal_animation', {
+              recipientId: g.slots[corteRecipIdx],
+              corteCard: s.visibleCorte
+            });
+          }
+        }
+
         // Comprar cartas (vencedor primeiro)
-        if (s.deck.length > 0) {
-          const winIdx = g.slots.indexOf(winnerId);
+        if (deckBefore > 0) {
           for (let i = 0; i < 4; i++) {
             if (s.deck.length > 0) {
               s.players[g.slots[(winIdx + i) % 4] as string].hand.push(s.deck.pop()!);
             }
           }
+          // Limpar visibleCorte se o baralho acabou (carta já foi para a mão)
+          if (s.deck.length === 0 && s.visibleCorte) s.visibleCorte = null;
+        }
+
+        // --- Última rodada: compartilhar cartas entre parceiros ---
+        const allHaveThree = Object.values(s.players).every(p => p.hand.length === 3);
+        if (allHaveThree && s.deck.length === 0 && !g.lastRoundShareDone) {
+          g.lastRoundShareDone = true;
+          const savedTurn = s.currentTurn;
+          s.currentTurn = 'SHARING'; // bloqueia jogadas durante a troca
+          io.to(roomId).emit('game_update', s);
+
+          for (let i = 0; i < 4; i++) {
+            const pid = g.slots[i];
+            if (!pid) continue;
+            const partnerId = g.slots[(i + 2) % 4];
+            if (!partnerId) continue;
+            const sid = userSockets[pid];
+            if (sid) {
+              io.to(sid).emit('last_round_card_share', {
+                partnerCards: s.players[partnerId].hand,
+                partnerId,
+                partnerNickname: g.nicknames[partnerId]
+              });
+            }
+          }
+
+          // Retomar após a animação (~8.5s): 1s envio + 5s visualização + 1s retorno + folga
+          setTimeout(() => {
+            if (!activeGames[roomId] || !activeGames[roomId].gameState) return;
+            activeGames[roomId].gameState.currentTurn = savedTurn;
+            io.to(roomId).emit('game_update', activeGames[roomId].gameState);
+            io.to(roomId).emit('last_round_share_done');
+          }, 8500);
+          return;
         }
 
         // Checar fim de mão (todos sem cartas + baralho vazio)
@@ -972,7 +1055,7 @@ io.on('connection', (socket: any) => {
             io.to(roomId).emit('game_finished', { winnerTeam: matchWinner });
             doQueueSwap(roomId, matchWinner === 1 ? 2 : 1);
           } else {
-            setTimeout(() => triggerNextHand(roomId), 9000); // Tempo para modal de pontuação
+            setTimeout(() => triggerNextHand(roomId), 9000);
           }
         } else {
           io.to(roomId).emit('game_update', s);

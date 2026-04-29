@@ -58,15 +58,27 @@ export default function GameRoom() {
     newGameScore: { team1: number; team2: number };
     isCopas: boolean; isCapote: boolean;
   } | null>(null);
-  // Novo: revelação do Ás do trunfo (banner simples)
+  // Revelação do Ás do trunfo (banner simples)
   const [aceReveal, setAceReveal] = useState<{ nickname: string } | null>(null);
-  // Novo: prompt de troca do 2 do corte
+  // Prompt de troca do 2 do corte
   const [trumpTwoPrompt, setTrumpTwoPrompt] = useState<{ corteCard: Card; twoCard: Card } | null>(null);
   const [swapPhase, setSwapPhase] = useState<'prompt' | 'animating' | null>(null);
-  // Novo: revelação especial do Ás quando 7 sai de fundo
+  // Revelação especial do Ás quando 7 sai de fundo
   const [sevenFundoReveal, setSevenFundoReveal] = useState<{ aceCard: Card; nickname: string; phase: 'show' | 'hide' } | null>(null);
-  // Fila de espectadores (visibilidade do painel flutuante)
+  // Revelação do 7 quando Ás é jogado antes
+  const [sevenReveal, setSevenReveal] = useState<{ sevenCard: Card; nickname: string; phase: 'show' | 'hide' } | null>(null);
+  // Fila de espectadores flutuante
   const [showSpecQueue, setShowSpecQueue] = useState(false);
+  // Animação de distribuição pós-vaza
+  const [postVazaDealActive, setPostVazaDealActive] = useState(false);
+  // Animação da carta do corte sendo distribuída
+  const [corteCardDealAnim, setCorteCardDealAnim] = useState<{ corteCard: Card; recipientId: string; phase: 'show' | 'flyout' } | null>(null);
+  // Última rodada: troca de cartas entre parceiros
+  const [lastRoundShare, setLastRoundShare] = useState<{
+    partnerCards: Card[];
+    partnerNickname: string;
+    phase: 'sending' | 'viewing' | 'returning';
+  } | null>(null);
 
   // Ref para roomData dentro de callbacks de socket (evita stale closure)
   const roomDataRef = useRef(roomData);
@@ -175,13 +187,60 @@ export default function GameRoom() {
       }, 1800);
     });
 
+    // Ás jogado: revela o 7 que o player tem na mão
+    socket.on('trump_seven_reveal', (data: any) => {
+      setSevenReveal({ sevenCard: data.sevenCard, nickname: data.nickname, phase: 'show' });
+      setTimeout(() => {
+        setSevenReveal(prev => prev ? { ...prev, phase: 'hide' } : null);
+        setTimeout(() => setSevenReveal(null), 600);
+      }, 1800);
+    });
+
+    // Animação de distribuição pós-vaza
+    socket.on('post_vaza_deal_sequence', ({ dealOrder }: { dealOrder: (string | null)[] }) => {
+      setPostVazaDealActive(true);
+      dealOrder.forEach((uid, idx) => {
+        setTimeout(() => {
+          if (!uid) return;
+          const rd = roomDataRef.current;
+          const playerIdx = rd.slots.indexOf(uid);
+          const myIdxLocal = rd.slots.indexOf(user?.id || null);
+          const relPos = myIdxLocal === -1 ? playerIdx : (playerIdx - myIdxLocal + 4) % 4;
+          setFlyingCardRelPos(relPos);
+          setFlyingCardKey(k => k + 1);
+        }, idx * 360);
+      });
+      setTimeout(() => {
+        setPostVazaDealActive(false);
+        setFlyingCardRelPos(null);
+      }, dealOrder.length * 360 + 500);
+    });
+
+    // Animação da carta do corte sendo distribuída
+    socket.on('corte_card_deal_animation', (data: any) => {
+      setCorteCardDealAnim({ corteCard: data.corteCard, recipientId: data.recipientId, phase: 'show' });
+      setTimeout(() => setCorteCardDealAnim(prev => prev ? { ...prev, phase: 'flyout' } : null), 800);
+      setTimeout(() => setCorteCardDealAnim(null), 1500);
+    });
+
+    // Última rodada: compartilhamento de cartas
+    socket.on('last_round_card_share', (data: any) => {
+      setLastRoundShare({ partnerCards: data.partnerCards, partnerNickname: data.partnerNickname, phase: 'sending' });
+      setTimeout(() => setLastRoundShare(prev => prev ? { ...prev, phase: 'viewing' } : null), 1200);
+      setTimeout(() => setLastRoundShare(prev => prev ? { ...prev, phase: 'returning' } : null), 6200);
+      setTimeout(() => setLastRoundShare(null), 7500);
+    });
+    socket.on('last_round_share_done', () => setLastRoundShare(null));
+
     return () => {
       ['init_sync','room_update','game_started','game_update','vaza_resolved','heley_notice',
        'hand_finished','game_finished','system_message','game_aborted','error',
        'swap_request_received','queue_updated','spectator_choose_replacement',
        'kick_vote_started','kick_vote_update','kick_vote_result','kicked_from_room',
        'player_disconnected','player_reconnected','trump_ace_reveal',
-       'trump_two_available','trump_seven_fundo_ace_reveal'
+       'trump_two_available','trump_seven_fundo_ace_reveal','trump_seven_reveal',
+       'post_vaza_deal_sequence','corte_card_deal_animation',
+       'last_round_card_share','last_round_share_done'
       ].forEach(ev => socket.off(ev));
     };
   }, [socket, currentRoomId, user?.id]);
@@ -205,6 +264,8 @@ export default function GameRoom() {
       setMyTeamCardCount(0);
       setOpponentCardCount(0);
       setHandResult(null);
+      setLastRoundShare(null);
+      setCorteCardDealAnim(null);
     }
   }, [gameState?.status, gameState?.visibleCorte]);
 
@@ -331,8 +392,11 @@ export default function GameRoom() {
             </div>
             <div className="flex justify-between items-center mt-1">
               <span className="text-[10px] text-slate-400">Modo:</span>
-              <span className={`text-[9px] font-bold px-2 py-0.5 rounded uppercase ${gameState.isCopas ? 'bg-red-500/20 text-red-400' : 'bg-slate-800 text-slate-500'}`}>
-                {gameState.isCopas ? 'COPAS' : 'NORMAL'}
+              <span className={`text-[9px] font-bold px-2 py-0.5 rounded uppercase ${
+                gameState.isCopas ? 'bg-red-500/20 text-red-400' :
+                (!gameState.visibleCorte && gameState.status === 'IN_GAME') ? 'bg-yellow-500/20 text-yellow-400' :
+                'bg-slate-800 text-slate-500'}`}>
+                {gameState.isCopas ? 'COPAS' : (!gameState.visibleCorte && gameState.status === 'IN_GAME') ? 'BISCA' : 'NORMAL'}
               </span>
             </div>
           </div>
@@ -595,17 +659,6 @@ export default function GameRoom() {
                             );
                           })()}
                         </div>
-                        <AnimatePresence>
-                          {flyingCardRelPos !== null && (
-                            <motion.div key={flyingCardKey}
-                              initial={{ x:0, y:0, opacity:1, scale:1 }}
-                              animate={{ x: flyingCardRelPos===1?260:flyingCardRelPos===3?-260:0, y: flyingCardRelPos===0?260:flyingCardRelPos===2?-260:0, opacity:0, scale:0.75 }}
-                              transition={{ duration:0.35, ease:'easeOut' }}
-                              className="absolute w-10 h-14 md:w-14 md:h-20 rounded-lg border-2 border-white/30 shadow-xl pointer-events-none z-50"
-                              style={{ background:'repeating-linear-gradient(45deg,#1e3a8a,#1e3a8a 5px,#2563eb 5px,#2563eb 10px)' }}
-                            />
-                          )}
-                        </AnimatePresence>
                         <p className="text-white font-black uppercase tracking-widest text-[8px] mt-10 animate-pulse italic bg-black/40 px-4 py-1 rounded-full border border-white/10">Dando cartas...</p>
                       </div>
                     )}
@@ -631,14 +684,36 @@ export default function GameRoom() {
                             </div>
                           </div>
                         )}
-                        {/* Indicador: quando baralho acabou mas há carta do corte */}
-                        {gameState.deck.length === 0 && !gameState.isCopas && gameState.visibleCorte && (
-                          <div className="absolute -right-2 -bottom-4 text-[8px] font-black text-yellow-400 bg-black/60 px-1.5 py-0.5 rounded-full border border-yellow-500/30 whitespace-nowrap">
-                            ↑ última carta
-                          </div>
-                        )}
+                        {/* Animação da carta do corte sendo distribuída */}
+                        <AnimatePresence>
+                          {corteCardDealAnim && (
+                            <motion.div
+                              className="absolute z-[60] pointer-events-none"
+                              initial={{ x: -80, y: 0, scale: 0.6, opacity: 0 }}
+                              animate={corteCardDealAnim.phase === 'show'
+                                ? { x: 0, y: 0, scale: 1.3, opacity: 1 }
+                                : { x: corteCardDealAnim.recipientId === (roomData.slots[myIdx] || '') ? 0 : 200, y: corteCardDealAnim.recipientId === (roomData.slots[myIdx] || '') ? 120 : -80, scale: 0.4, opacity: 0 }}
+                              transition={{ duration: corteCardDealAnim.phase === 'show' ? 0.35 : 0.5, ease: 'easeInOut' }}
+                            >
+                              <GameCard card={corteCardDealAnim.corteCard} size="lg" faceDown={corteCardDealAnim.phase === 'flyout'} />
+                            </motion.div>
+                          )}
+                        </AnimatePresence>
                       </motion.div>
                     )}
+
+                    {/* Flying card — distribuição inicial (DEALING) e pós-vaza */}
+                    <AnimatePresence>
+                      {flyingCardRelPos !== null && (gameState.status === 'DEALING' || postVazaDealActive) && (
+                        <motion.div key={flyingCardKey}
+                          initial={{ x:0, y:0, opacity:1, scale:1 }}
+                          animate={{ x: flyingCardRelPos===1?260:flyingCardRelPos===3?-260:0, y: flyingCardRelPos===0?260:flyingCardRelPos===2?-260:0, opacity:0, scale:0.75 }}
+                          transition={{ duration:0.35, ease:'easeOut' }}
+                          className="absolute w-10 h-14 md:w-14 md:h-20 rounded-lg border-2 border-white/30 shadow-xl pointer-events-none z-50"
+                          style={{ background:'repeating-linear-gradient(45deg,#1e3a8a,#1e3a8a 5px,#2563eb 5px,#2563eb 10px)' }}
+                        />
+                      )}
+                    </AnimatePresence>
 
                     {/* Cartas na mesa (vaza) */}
                     <AnimatePresence>
@@ -827,6 +902,99 @@ export default function GameRoom() {
                   className="flex-1 bg-slate-800 border-none rounded-2xl px-5 py-3 text-white focus:ring-2 focus:ring-blue-500 font-bold placeholder:text-slate-600" />
                 <button type="submit" className="shrink-0 bg-blue-600 hover:bg-blue-500 text-white p-4 rounded-2xl active:scale-95"><Send size={20} /></button>
               </form>
+            </div>
+          )}
+        </AnimatePresence>
+
+        {/* Revelação do 7 — Ás jogado antes do 7 */}
+        <AnimatePresence>
+          {sevenReveal && (
+            <motion.div className="absolute inset-0 flex flex-col items-center justify-center z-[258] pointer-events-none"
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+              <div className="bg-black/55 backdrop-blur-sm absolute inset-0" />
+              <motion.div className="relative z-10 flex flex-col items-center gap-3"
+                initial={{ scale: 0.3, y: 60 }}
+                animate={sevenReveal.phase === 'show' ? { scale: 1.9, y: 0 } : { scale: 0.4, y: 80, opacity: 0 }}
+                transition={{ type: 'spring', damping: 18, stiffness: 220 }}>
+                <GameCard card={sevenReveal.sevenCard} size="lg" />
+              </motion.div>
+              <motion.p
+                initial={{ opacity: 0, y: 20 }}
+                animate={sevenReveal.phase === 'show' ? { opacity: 1, y: 0 } : { opacity: 0 }}
+                className="relative z-10 mt-8 text-white font-black text-xs uppercase tracking-widest bg-emerald-800/90 px-4 py-2 rounded-full border border-emerald-400/50">
+                {sevenReveal.nickname} tem o 7 do corte!
+              </motion.p>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Última rodada — troca de cartas entre parceiros */}
+        <AnimatePresence>
+          {lastRoundShare && (
+            <div className="fixed inset-0 bg-slate-950/90 backdrop-blur-md flex flex-col items-center justify-center z-[275] p-4">
+              <motion.div initial={{ scale: 0.85, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }}
+                className="bg-slate-800 border-2 border-blue-500/60 p-6 rounded-[2rem] shadow-2xl max-w-sm w-full text-center">
+
+                {lastRoundShare.phase === 'sending' && (
+                  <>
+                    <div className="text-2xl mb-2">↑</div>
+                    <h4 className="text-sm font-black text-white uppercase mb-1">Última rodada!</h4>
+                    <p className="text-slate-400 text-xs mb-4">Enviando suas cartas para <span className="text-blue-300 font-bold">{lastRoundShare.partnerNickname}</span> ver...</p>
+                    <div className="flex justify-center gap-2">
+                      {[0,1,2].map(i => (
+                        <motion.div key={i}
+                          initial={{ y: 0, opacity: 1 }}
+                          animate={{ y: -80, opacity: 0 }}
+                          transition={{ delay: i * 0.15, duration: 0.5 }}>
+                          <div className="w-10 h-14 rounded-lg border-2 border-white/30"
+                            style={{ background:'repeating-linear-gradient(45deg,#1e3a8a,#1e3a8a 5px,#2563eb 5px,#2563eb 10px)' }} />
+                        </motion.div>
+                      ))}
+                    </div>
+                  </>
+                )}
+
+                {lastRoundShare.phase === 'viewing' && (
+                  <>
+                    <h4 className="text-sm font-black text-white uppercase mb-1">Cartas de {lastRoundShare.partnerNickname}</h4>
+                    <p className="text-slate-500 text-[9px] mb-4 uppercase font-bold">Visível apenas para você</p>
+                    <div className="flex justify-center gap-3 flex-wrap">
+                      {lastRoundShare.partnerCards.map(card => (
+                        <motion.div key={card.id}
+                          initial={{ y: -40, opacity: 0, scale: 0.7 }}
+                          animate={{ y: 0, opacity: 1, scale: 1 }}
+                          transition={{ type: 'spring', damping: 18 }}>
+                          <GameCard card={card} size="md" />
+                        </motion.div>
+                      ))}
+                    </div>
+                    <div className="mt-4 h-1.5 bg-slate-700 rounded-full overflow-hidden">
+                      <motion.div className="h-full bg-blue-500 rounded-full"
+                        initial={{ width: '100%' }}
+                        animate={{ width: '0%' }}
+                        transition={{ duration: 5, ease: 'linear' }} />
+                    </div>
+                  </>
+                )}
+
+                {lastRoundShare.phase === 'returning' && (
+                  <>
+                    <div className="text-2xl mb-2">↓</div>
+                    <h4 className="text-sm font-black text-white uppercase mb-1">Retornando suas cartas...</h4>
+                    <div className="flex justify-center gap-2">
+                      {[0,1,2].map(i => (
+                        <motion.div key={i}
+                          initial={{ y: -80, opacity: 0 }}
+                          animate={{ y: 0, opacity: 1 }}
+                          transition={{ delay: i * 0.15, duration: 0.4 }}>
+                          <div className="w-10 h-14 rounded-lg border-2 border-white/30"
+                            style={{ background:'repeating-linear-gradient(45deg,#1e3a8a,#1e3a8a 5px,#2563eb 5px,#2563eb 10px)' }} />
+                        </motion.div>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </motion.div>
             </div>
           )}
         </AnimatePresence>
@@ -1086,7 +1254,7 @@ function PlayerSlot({ relPos, isTurn, nickname, isMe, team, vazaCard, onSwap, sh
   const teamRing = tc ? tc.ring : 'border-slate-600';
 
   return (
-    <div className={`absolute pointer-events-none z-10 ${posClasses[relPos]}`}>
+    <div className={`absolute pointer-events-none z-10 transition-transform duration-300 ${posClasses[relPos]} ${isTurn ? 'scale-125' : ''}`}>
       <div className="flex flex-col items-center gap-1 relative">
         {/* Cartas na mão (verso ou face visível) */}
         {handSize > 0 && relPos !== 0 && (
