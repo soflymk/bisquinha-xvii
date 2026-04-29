@@ -44,7 +44,7 @@ export default function Login() {
         
         <div className="text-center mb-10">
           <h2 className="text-4xl font-black text-white tracking-widest uppercase italic">Acesso</h2>
-          <p className="text-slate-400 text-sm mt-2 font-medium">Bem-vindo à maior arena de Bisca do ES.</p>
+          <p className="text-slate-400 text-sm mt-2 font-medium">Bem-vindo a bisquinha do CFO XVII.</p>
         </div>
         
         {error && (
@@ -55,7 +55,7 @@ export default function Login() {
 
         <form onSubmit={handleLogin} className="space-y-6">
           <div>
-            <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-3 ml-2">Identidade</label>
+            <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-3 ml-2">Login</label>
             <div className="relative group">
               <User className="absolute left-4 top-4 text-slate-500 group-focus-within:text-blue-400 transition-colors" size={18} />
               <input 
@@ -63,14 +63,14 @@ export default function Login() {
                 value={username}
                 onChange={e => setUsername(e.target.value)}
                 className="w-full bg-slate-900 border-2 border-slate-700 rounded-2xl py-4 pl-12 pr-6 text-white font-bold focus:outline-none focus:border-blue-500 transition-all placeholder:text-slate-700"
-                placeholder="Ex: joao_vix"
+                placeholder="Ex: relamp_marquinhos"
                 required
               />
             </div>
           </div>
 
           <div>
-             <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-3 ml-2">Chave de Segurança</label>
+             <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-3 ml-2">Senha</label>
              <div className="relative group">
               <Lock className="absolute left-4 top-4 text-slate-500 group-focus-within:text-blue-400 transition-colors" size={18} />
               <input 
@@ -88,13 +88,13 @@ export default function Login() {
             type="submit"
             className="w-full bg-blue-600 hover:bg-blue-500 text-white font-black py-5 rounded-2xl transition-all shadow-xl shadow-blue-900/20 active:scale-[0.97] uppercase text-xs tracking-[0.2em]"
           >
-            Entrar na Arena
+            Entrar
           </button>
         </form>
 
         <div className="mt-10 pt-8 border-t border-slate-700/50 text-center">
           <p className="text-slate-500 text-[10px] font-bold uppercase tracking-widest italic leading-relaxed">
-            "A variante Capixaba: <br /> 7 de ouros no corte, bisca na mão!"
+            "Biquinha do CFO XVII: <br /> Toma helay, vai tomando!"
           </p>
         </div>
       </motion.div>
