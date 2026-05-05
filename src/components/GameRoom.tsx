@@ -56,7 +56,7 @@ export default function GameRoom() {
     team1Points: number; team2Points: number;
     winnerTeam: 1 | 2; pointsWon: number;
     newGameScore: { team1: number; team2: number };
-    isCopas: boolean; isCapote: boolean;
+    isCopas: boolean; isCapote: boolean; isCloseCall: boolean;
   } | null>(null);
   // Revelação do Ás do trunfo (banner simples)
   const [aceReveal, setAceReveal] = useState<{ nickname: string } | null>(null);
@@ -232,9 +232,25 @@ export default function GameRoom() {
     });
     socket.on('last_round_share_done', () => setLastRoundShare(null));
 
+    // Fim de partida → servidor limpou o jogo, volta para sala de espera
+    socket.on('game_reset', () => {
+      setGameState(null);
+      setHandResult(null);
+      setHeleyNotice(null);
+      setMyTeamCardCount(0);
+      setOpponentCardCount(0);
+      setPostVazaDealActive(false);
+      setCorteCardDealAnim(null);
+      setLastRoundShare(null);
+      setFlyingCardRelPos(null);
+      setSevenReveal(null);
+      setSevenFundoReveal(null);
+      setAceReveal(null);
+    });
+
     return () => {
       ['init_sync','room_update','game_started','game_update','vaza_resolved','heley_notice',
-       'hand_finished','game_finished','system_message','game_aborted','error',
+       'hand_finished','game_finished','game_reset','system_message','game_aborted','error',
        'swap_request_received','queue_updated','spectator_choose_replacement',
        'kick_vote_started','kick_vote_update','kick_vote_result','kicked_from_room',
        'player_disconnected','player_reconnected','trump_ace_reveal',
@@ -1102,11 +1118,20 @@ export default function GameRoom() {
               <motion.div initial={{ scale:0.8, opacity:0, y:40 }} animate={{ scale:1, opacity:1, y:0 }} exit={{ scale:0.9, opacity:0 }}
                 transition={{ type:'spring', damping:20, stiffness:250 }}
                 className="bg-slate-800 border-2 border-slate-600 p-8 rounded-[2.5rem] shadow-2xl max-w-sm w-full text-center">
-                <div className="text-3xl mb-3">{handResult.isCapote ? '💥' : '🃏'}</div>
+                <div className="text-3xl mb-3">{handResult.isCapote ? '💥' : handResult.isCloseCall ? '⚠️' : '🃏'}</div>
                 <h3 className="text-xl font-black text-white uppercase mb-1">
                   {handResult.isCapote ? 'CAPOTE!' : 'Fim da Mão!'}
                 </h3>
                 {handResult.isCopas && <p className="text-red-400 text-xs font-black uppercase mb-3">♥ Mão de Copas</p>}
+                {handResult.isCloseCall && (
+                  <div className="flex items-center justify-center gap-2 bg-amber-900/40 border border-amber-500/60 rounded-xl px-4 py-2 mb-3">
+                    <span className="text-amber-400 text-sm">⚠️</span>
+                    <p className="text-amber-300 text-[10px] font-black uppercase tracking-wide">
+                      59 × 61 — Resultado apertado!<br/>
+                      <span className="text-amber-200 font-bold normal-case tracking-normal">Ponto duplo para a dupla vencedora</span>
+                    </p>
+                  </div>
+                )}
 
                 {/* Pontuação das duplas */}
                 <div className="flex gap-3 my-5">
@@ -1120,7 +1145,12 @@ export default function GameRoom() {
                         <p className={`text-[9px] font-black uppercase tracking-widest ${tc.text}`}>{tc.label}</p>
                         <CountUp target={pts} className={`text-3xl font-black mt-1 block ${isWinner ? 'text-white' : 'text-slate-400'}`} />
                         <p className="text-[8px] text-slate-500 mt-1">pontos em cartas</p>
-                        {isWinner && <div className={`text-[9px] font-black mt-2 uppercase ${tc.text}`}>+{handResult.pointsWon} gol{handResult.pointsWon>1?'s':''} ✓</div>}
+                        {isWinner && (
+                          <div className={`text-[9px] font-black mt-2 uppercase ${tc.text}`}>
+                            +{handResult.pointsWon} gol{handResult.pointsWon>1?'s':''} ✓
+                            {handResult.isCloseCall && <span className="ml-1 text-amber-400">(×2)</span>}
+                          </div>
+                        )}
                       </div>
                     );
                   })}
@@ -1135,7 +1165,9 @@ export default function GameRoom() {
                     <div className="text-center"><p className="text-[9px] text-orange-400 font-bold">Dupla 2</p><p className="text-3xl font-black text-white">{handResult.newGameScore.team2}</p></div>
                   </div>
                 </div>
-                <p className="text-[9px] text-slate-500 uppercase font-bold tracking-widest">Próxima mão começa em instantes...</p>
+                <p className="text-[9px] text-slate-500 uppercase font-bold tracking-widest">
+                  {gameState?.status === 'FINISHED' ? 'Partida encerrada — aguardando sala de espera...' : 'Próxima mão começa em instantes...'}
+                </p>
               </motion.div>
             </div>
           )}

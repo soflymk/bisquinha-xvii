@@ -608,7 +608,7 @@ io.on('connection', (socket: any) => {
               }
             }
           }
-        }, 400);
+        }, 600);
       }, 400);
     }, isBater ? 0 : 800);
   });
@@ -667,6 +667,8 @@ io.on('connection', (socket: any) => {
     const finalize = () => {
       game.gameState = null as any;
       try { db.prepare('UPDATE rooms SET status = ? WHERE id = ?').run('WAITING', roomId); } catch {}
+      // Limpa o estado do jogo nos clientes → volta para sala de espera
+      io.to(roomId).emit('game_reset');
       io.to(roomId).emit('room_update', {
         slots: game.slots, nicknames: game.nicknames,
         teams: game.teams, ownerId: game.ownerId, spectators: game.spectators
@@ -889,12 +891,14 @@ io.on('connection', (socket: any) => {
     }
 
     // --- REGRA: 7 do corte não pode sair de fundo (último da rodada) ---
-    // Exceção: baralho vazio OU tem o Ás do corte na mão (animação especial de revelação)
+    // Exceção 1: tem o Ás do corte na mão (animação especial de revelação)
+    // Exceção 2: é a ÚLTIMA rodada absoluta (jogador tem somente 1 carta na mão)
     // Outros 7 e ÁS (de outros naipes) podem ser jogados normalmente.
     let sevenFundoAceCard: Card | null = null;
     if (card.suit === state.trumpSuit && card.value === '7' && state.vaza.length === 3) {
       const aceEntry = player.hand.find((c, i) => i !== cardIdx && c.suit === state.trumpSuit && c.value === 'A');
-      if (state.deck.length > 0 && !aceEntry) {
+      const isPlayerLastCard = player.hand.length === 1; // única carta — obrigado a jogar
+      if (!isPlayerLastCard && !aceEntry) {
         socket.emit('error', 'O 7 do corte não pode ser o último jogado na rodada!');
         return;
       }
@@ -974,8 +978,8 @@ io.on('connection', (socket: any) => {
           const dealOrder = Array.from({ length: dealCount }, (_, i) => g.slots[(winIdx + i) % 4]);
           io.to(roomId).emit('post_vaza_deal_sequence', { dealOrder });
 
-          // Carta do corte vai para um jogador? (está em deck[0] = última a ser sacada)
-          if (s.visibleCorte && s.deck[0]?.id === s.visibleCorte.id) {
+          // Carta do corte vai para um jogador? Só anima na ÚLTIMA distribuição (≤4 cartas no baralho)
+          if (s.visibleCorte && s.deck[0]?.id === s.visibleCorte.id && deckBefore <= 4) {
             const corteRecipIdx = (winIdx + dealCount - 1) % 4;
             io.to(roomId).emit('corte_card_deal_animation', {
               recipientId: g.slots[corteRecipIdx],
@@ -1036,15 +1040,18 @@ io.on('connection', (socket: any) => {
           const handWinner: 1 | 2 = t1Pts >= t2Pts ? 1 : 2;
           const loserPts = handWinner === 1 ? t2Pts : t1Pts;
           const isCapote = loserPts <= 30;
+          // Regra 59x61: se o resultado for exatamente 59 vs 61, o vencedor leva 2 gols (dobrado)
+          const isCloseCall = !isCapote && ((t1Pts === 59 && t2Pts === 61) || (t1Pts === 61 && t2Pts === 59));
           let pts = s.isCopas ? 2 : 1;
           if (isCapote) pts = s.isCopas ? 3 : 2;
+          if (isCloseCall) pts = s.isCopas ? 4 : 2; // 59x61 = ponto duplo
           if (handWinner === 1) s.gameScore.team1 += pts;
           else s.gameScore.team2 += pts;
 
           io.to(roomId).emit('hand_finished', {
             team1Points: t1Pts, team2Points: t2Pts,
             winnerTeam: handWinner, pointsWon: pts,
-            newGameScore: s.gameScore, isCopas: s.isCopas, isCapote
+            newGameScore: s.gameScore, isCopas: s.isCopas, isCapote, isCloseCall
           });
           io.to(roomId).emit('game_update', s);
 
