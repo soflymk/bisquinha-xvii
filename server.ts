@@ -6,79 +6,79 @@ import session from 'express-session';
 import cookieParser from 'cookie-parser';
 import bcrypt from 'bcryptjs';
 import { v4 as uuidv4 } from 'uuid';
-import Database from 'better-sqlite3';
+import { Pool } from 'pg';
 import { BiscaEngine } from './src/lib/engine';
 import { Card, GameState, RoomStatus, User, Suit, ChatMessage } from './src/lib/types';
 
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
-const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'bisca.db');
 
-// Database Setup (better-sqlite3 — síncrono, sem GLIBC issues)
-console.log(`Initializing database at: ${DB_PATH}`);
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY,
-    username TEXT UNIQUE,
-    password_hash TEXT,
-    nickname TEXT,
-    role TEXT DEFAULT 'USER',
-    is_active INTEGER DEFAULT 1,
-    created_at INTEGER
-  );
-  CREATE TABLE IF NOT EXISTS rooms (
-    id TEXT PRIMARY KEY,
-    name TEXT,
-    owner_id TEXT,
-    score_goal INTEGER DEFAULT 5,
-    time_limit INTEGER DEFAULT 0,
-    status TEXT DEFAULT 'WAITING',
-    created_at INTEGER
-  );
-`);
-
-// Limpeza de salas órfãs de processos anteriores
-console.log("Cleaning up orphaned rooms...");
-db.prepare("DELETE FROM rooms WHERE status != 'FINISHED'").run();
-
-// Admin padrão
-// A senha pode ser definida via variável de ambiente ADMIN_PASSWORD.
-// Se não fornecida, usa 'admin123'. Para alterar no Render: Dashboard → Environment → ADMIN_PASSWORD.
-const adminId = 'admin-uuid';
-const adminPassword = process.env.ADMIN_PASSWORD || 'admin123';
-const adminRow = db.prepare('SELECT id FROM users WHERE username = ?').get('admin') as any;
-if (!adminRow) {
-  console.log("Creating default admin user...");
-  const hash = bcrypt.hashSync(adminPassword, 10);
-  db.prepare('INSERT INTO users (id, username, password_hash, nickname, role, is_active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(adminId, 'admin', hash, 'Administrador', 'ADMIN', 1, Date.now());
-  console.log("Admin user created.");
-} else {
-  // Garante que o role e is_active do admin estejam corretos (proteção contra corrupção de dados).
-  db.prepare("UPDATE users SET role = 'ADMIN', is_active = 1 WHERE username = 'admin'").run();
-  console.log("Admin user already exists.");
+// DATABASE_URL deve ser definida como variável de ambiente no Render
+// Formato Neon: postgresql://user:pass@host/db?sslmode=require
+const DATABASE_URL = process.env.DATABASE_URL;
+if (!DATABASE_URL) {
+  console.error('FATAL: DATABASE_URL environment variable is not set.');
+  process.exit(1);
 }
+
+console.log('Connecting to PostgreSQL (Neon)...');
+const pool = new Pool({ connectionString: DATABASE_URL });
+
+// ── Inicialização do banco (schema + admin) ──────────────────────────────────
+
+const initDB = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id          TEXT PRIMARY KEY,
+      username    TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      nickname    TEXT NOT NULL,
+      role        TEXT NOT NULL DEFAULT 'USER',
+      is_active   INTEGER NOT NULL DEFAULT 1,
+      created_at  BIGINT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS rooms (
+      id          TEXT PRIMARY KEY,
+      name        TEXT NOT NULL,
+      owner_id    TEXT NOT NULL,
+      score_goal  INTEGER NOT NULL DEFAULT 5,
+      time_limit  INTEGER NOT NULL DEFAULT 0,
+      status      TEXT NOT NULL DEFAULT 'WAITING',
+      created_at  BIGINT NOT NULL
+    );
+  `);
+
+  console.log('Cleaning up orphaned rooms...');
+  await pool.query("DELETE FROM rooms WHERE status != 'FINISHED'");
+
+  // Admin padrão — senha via ADMIN_PASSWORD env var (padrão: admin123)
+  const adminId = 'admin-uuid';
+  const adminPassword = process.env.ADMIN_PASSWORD || 'admin123';
+  const { rows: adminRows } = await pool.query('SELECT id FROM users WHERE username = $1', ['admin']);
+  if (adminRows.length === 0) {
+    console.log('Creating default admin user...');
+    const hash = bcrypt.hashSync(adminPassword, 10);
+    await pool.query(
+      'INSERT INTO users (id, username, password_hash, nickname, role, is_active, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+      [adminId, 'admin', hash, 'Administrador', 'ADMIN', 1, Date.now()]
+    );
+    console.log('Admin user created.');
+  } else {
+    await pool.query("UPDATE users SET role = 'ADMIN', is_active = 1 WHERE username = 'admin'");
+    console.log('Admin user already exists.');
+  }
+};
+
+// ── Express / Socket.IO setup ────────────────────────────────────────────────
 
 const app = express();
 const httpServer = createServer(app);
-const io = new Server(httpServer, {
-  cors: {
-    origin: true,
-    credentials: true
-  }
-});
+const io = new Server(httpServer, { cors: { origin: true, credentials: true } });
 
-// Necessário para que o Express confie no proxy HTTPS do Render (e outros PaaS).
-// Sem isso, req.secure = false → express-session não envia o Set-Cookie com secure:true.
 app.set('trust proxy', 1);
-
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
-// Usando MemoryStore (aceitável para esta escala)
 const sessionMiddleware = session({
   secret: process.env.SESSION_SECRET || 'bisca-secret-key-dev-change-in-production',
   resave: false,
@@ -92,17 +92,16 @@ const sessionMiddleware = session({
 });
 
 app.use(sessionMiddleware);
-
-// Middleware para disponibilizar session no socket
 io.engine.use(sessionMiddleware);
 
-const userSockets: Record<string, string> = {}; // userId -> socketId
+const userSockets: Record<string, string> = {};
 
-// Estado das salas em memória para rapidez (Multiplayer)
+// ── Estado em memória ────────────────────────────────────────────────────────
+
 const activeGames: Record<string, {
   gameState: GameState;
   config: { scoreGoal: number; timeLimit: number; allowSpectators: boolean; spectatorsSeeHands: boolean };
-  slots: (string | null)[]; // userIds
+  slots: (string | null)[];
   ownerId: string;
   nicknames: Record<string, string>;
   teams: Record<string, 1 | 2>;
@@ -116,39 +115,37 @@ const activeGames: Record<string, {
   lastRoundShareDone: boolean;
 }> = {};
 
-const cleanupRoom = (roomId: string, io: Server) => {
+// ── Helper: limpar sala vazia ────────────────────────────────────────────────
+
+const cleanupRoom = async (roomId: string, io: Server) => {
   const game = activeGames[roomId];
   if (!game) return;
 
   if (game.slots.every(s => s === null)) {
     console.log(`Closing empty room: ${roomId}`);
     delete activeGames[roomId];
-    try { db.prepare('DELETE FROM rooms WHERE id = ?').run(roomId); } catch {}
+    try { await pool.query('DELETE FROM rooms WHERE id = $1', [roomId]); } catch {}
     io.emit('rooms_updated');
   } else {
-    // Reassign owner if previous owner is gone
     if (!game.slots.includes(game.ownerId)) {
       const nextOwner = game.slots.find(s => s !== null);
       if (nextOwner) game.ownerId = nextOwner;
     }
-
     io.to(roomId).emit('room_update', {
-      slots: game.slots,
-      nicknames: game.nicknames,
-      teams: game.teams,
-      ownerId: game.ownerId,
-      spectators: game.spectators
+      slots: game.slots, nicknames: game.nicknames,
+      teams: game.teams, ownerId: game.ownerId, spectators: game.spectators
     });
   }
 };
 
-// --- API ROTAS ---
+// ── API Routes ───────────────────────────────────────────────────────────────
 
 // Auth
-app.post('/api/login', (req: any, res) => {
+app.post('/api/login', async (req: any, res) => {
   const { username, password } = req.body;
   try {
-    const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username) as any;
+    const { rows } = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+    const user = rows[0];
     if (!user) return res.status(401).json({ error: 'Usuário não encontrado' });
     if (!user.is_active) return res.status(403).json({ error: 'Conta inativa. Entre em contato com o administrador.' });
 
@@ -161,16 +158,17 @@ app.post('/api/login', (req: any, res) => {
       res.status(401).json({ error: 'Senha incorreta' });
     }
   } catch (e) {
+    console.error('Login error:', e);
     res.status(500).json({ error: 'Erro interno' });
   }
 });
 
-app.get('/api/me', (req: any, res) => {
+app.get('/api/me', async (req: any, res) => {
   if (!req.session.userId) return res.status(401).json({ error: 'Não logado' });
   try {
-    const user = db.prepare('SELECT id, username, nickname, role, is_active FROM users WHERE id = ?').get(req.session.userId);
-    if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
-    res.json(user);
+    const { rows } = await pool.query('SELECT id, username, nickname, role, is_active FROM users WHERE id = $1', [req.session.userId]);
+    if (!rows[0]) return res.status(404).json({ error: 'Usuário não encontrado' });
+    res.json(rows[0]);
   } catch (e) {
     res.status(500).json({ error: 'Erro interno' });
   }
@@ -184,110 +182,105 @@ app.post('/api/logout', (req: any, res) => {
 });
 
 // Admin
-app.get('/api/admin/users', (req: any, res) => {
+app.get('/api/admin/users', async (req: any, res) => {
   if (req.session.role !== 'ADMIN') return res.status(403).json({ error: 'Acesso negado' });
   try {
-    const rows = db.prepare('SELECT id, username, nickname, role, is_active, created_at FROM users').all();
+    const { rows } = await pool.query('SELECT id, username, nickname, role, is_active, created_at FROM users ORDER BY created_at ASC');
     res.json(rows || []);
   } catch (e) {
     res.status(500).json({ error: 'Erro ao buscar usuários' });
   }
 });
 
-app.post('/api/admin/users/toggle', (req: any, res) => {
+app.post('/api/admin/users/toggle', async (req: any, res) => {
   if (req.session.role !== 'ADMIN') return res.status(403).json({ error: 'Acesso negado' });
   const { userId, active } = req.body;
   try {
-    db.prepare('UPDATE users SET is_active = ? WHERE id = ?').run(active ? 1 : 0, userId);
+    await pool.query('UPDATE users SET is_active = $1 WHERE id = $2', [active ? 1 : 0, userId]);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: 'Erro ao atualizar usuário' });
   }
 });
 
-app.post('/api/admin/users/create', (req: any, res) => {
+app.post('/api/admin/users/create', async (req: any, res) => {
   if (req.session.role !== 'ADMIN') return res.status(403).json({ error: 'Acesso negado' });
   const { username, nickname, password } = req.body;
-
-  if (!username || !nickname || !password) {
-    return res.status(400).json({ error: 'Campos obrigatórios ausentes' });
-  }
+  if (!username || !nickname || !password) return res.status(400).json({ error: 'Campos obrigatórios ausentes' });
 
   try {
-    const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
-    if (existing) return res.status(400).json({ error: 'Usuário já existe' });
+    const { rows } = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
+    if (rows[0]) return res.status(400).json({ error: 'Usuário já existe' });
 
     const id = uuidv4();
     const hash = bcrypt.hashSync(password, 10);
-    db.prepare('INSERT INTO users (id, username, password_hash, nickname, role, is_active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .run(id, username, hash, nickname, 'USER', 1, Date.now());
+    await pool.query(
+      'INSERT INTO users (id, username, password_hash, nickname, role, is_active, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+      [id, username, hash, nickname, 'USER', 1, Date.now()]
+    );
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: 'Erro ao criar usuário' });
   }
 });
 
-app.post('/api/admin/users/promote', (req: any, res) => {
+app.post('/api/admin/users/promote', async (req: any, res) => {
   if (req.session.role !== 'ADMIN') return res.status(403).json({ error: 'Acesso negado' });
   const { userId, role } = req.body;
   try {
-    db.prepare('UPDATE users SET role = ? WHERE id = ?').run(role, userId);
+    await pool.query('UPDATE users SET role = $1 WHERE id = $2', [role, userId]);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: 'Erro ao atualizar nível' });
   }
 });
 
-app.post('/api/admin/users/reset-password', (req: any, res) => {
+app.post('/api/admin/users/reset-password', async (req: any, res) => {
   if (req.session.role !== 'ADMIN') return res.status(403).json({ error: 'Acesso negado' });
   const { userId, newPassword } = req.body;
   if (!newPassword || newPassword.length < 4) return res.status(400).json({ error: 'Senha curta demais' });
-
   try {
-    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(newPassword, 10), userId);
+    await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [bcrypt.hashSync(newPassword, 10), userId]);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: 'Erro ao redefinir senha' });
   }
 });
 
-app.post('/api/admin/users/delete', (req: any, res) => {
+app.post('/api/admin/users/delete', async (req: any, res) => {
   if (req.session.role !== 'ADMIN') return res.status(403).json({ error: 'Acesso negado' });
   const { userId } = req.body;
   if (userId === 'admin-uuid') return res.status(400).json({ error: 'Não é possível excluir o administrador padrão.' });
   if (userId === req.session.userId) return res.status(400).json({ error: 'Você não pode se excluir.' });
   try {
-    db.prepare('DELETE FROM users WHERE id = ?').run(userId);
+    await pool.query('DELETE FROM users WHERE id = $1', [userId]);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: 'Erro ao excluir usuário' });
   }
 });
 
-app.post('/api/me/change-password', (req: any, res) => {
+app.post('/api/me/change-password', async (req: any, res) => {
   if (!req.session.userId) return res.status(401).json({ error: 'Não logado' });
   const { currentPassword, newPassword } = req.body;
   if (!newPassword || newPassword.length < 4) return res.status(400).json({ error: 'Nova senha curta demais' });
-
   try {
-    const user = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(req.session.userId) as any;
-    if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
-    if (!bcrypt.compareSync(currentPassword, user.password_hash)) return res.status(400).json({ error: 'Senha atual incorreta' });
-
-    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(newPassword, 10), req.session.userId);
+    const { rows } = await pool.query('SELECT password_hash FROM users WHERE id = $1', [req.session.userId]);
+    if (!rows[0]) return res.status(404).json({ error: 'Usuário não encontrado' });
+    if (!bcrypt.compareSync(currentPassword, rows[0].password_hash)) return res.status(400).json({ error: 'Senha atual incorreta' });
+    await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [bcrypt.hashSync(newPassword, 10), req.session.userId]);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: 'Erro ao alterar senha' });
   }
 });
 
-app.post('/api/me/update-nickname', (req: any, res) => {
+app.post('/api/me/update-nickname', async (req: any, res) => {
   if (!req.session.userId) return res.status(401).json({ error: 'Não logado' });
   const { nickname } = req.body;
   if (!nickname || nickname.length < 2) return res.status(400).json({ error: 'Apelido inválido' });
-
   try {
-    db.prepare('UPDATE users SET nickname = ? WHERE id = ?').run(nickname, req.session.userId);
+    await pool.query('UPDATE users SET nickname = $1 WHERE id = $2', [nickname, req.session.userId]);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: 'Erro ao atualizar apelido' });
@@ -295,11 +288,10 @@ app.post('/api/me/update-nickname', (req: any, res) => {
 });
 
 // Admin Rooms
-app.get('/api/admin/rooms/active', (req: any, res) => {
+app.get('/api/admin/rooms/active', async (req: any, res) => {
   if (req.session.role !== 'ADMIN') return res.status(403).json({ error: 'Acesso negado' });
-
   try {
-    const rows = db.prepare('SELECT * FROM rooms').all() as any[];
+    const { rows } = await pool.query('SELECT * FROM rooms');
     const rooms = rows.map(r => ({
       ...r,
       playerCount: (activeGames[r.id] && activeGames[r.id].slots.filter(s => s !== null).length) || 0,
@@ -311,18 +303,16 @@ app.get('/api/admin/rooms/active', (req: any, res) => {
   }
 });
 
-app.post('/api/admin/rooms/close', (req: any, res) => {
+app.post('/api/admin/rooms/close', async (req: any, res) => {
   if (req.session.role !== 'ADMIN') return res.status(403).json({ error: 'Acesso negado' });
   const { roomId } = req.body;
-
   const game = activeGames[roomId];
   if (game) {
     io.to(roomId).emit('game_aborted', { reason: 'Esta sala foi encerrada por um administrador do Quartel General.' });
     delete activeGames[roomId];
   }
-
   try {
-    db.prepare('DELETE FROM rooms WHERE id = ?').run(roomId);
+    await pool.query('DELETE FROM rooms WHERE id = $1', [roomId]);
     io.emit('rooms_updated');
     res.json({ success: true });
   } catch (e) {
@@ -331,9 +321,9 @@ app.post('/api/admin/rooms/close', (req: any, res) => {
 });
 
 // Rooms
-app.get('/api/rooms', (req, res) => {
+app.get('/api/rooms', async (req, res) => {
   try {
-    const rows = db.prepare("SELECT * FROM rooms WHERE status != 'FINISHED'").all() as any[];
+    const { rows } = await pool.query("SELECT * FROM rooms WHERE status != 'FINISHED'");
     const roomsWithCount = rows.map(r => ({
       ...r,
       playerCount: (activeGames[r.id] && activeGames[r.id].slots.filter(s => s !== null).length) || 0,
@@ -346,15 +336,15 @@ app.get('/api/rooms', (req, res) => {
   }
 });
 
-app.post('/api/rooms/create', (req: any, res) => {
+app.post('/api/rooms/create', async (req: any, res) => {
   if (!req.session.userId) return res.status(401).json({ error: 'Não logado' });
   const { name, scoreGoal, timeLimit, allowSpectators, spectatorsSeeHands } = req.body;
   const roomId = uuidv4();
-
   try {
-    db.prepare('INSERT INTO rooms (id, name, owner_id, score_goal, time_limit, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(roomId, name, req.session.userId, scoreGoal, timeLimit, Date.now());
-
+    await pool.query(
+      'INSERT INTO rooms (id, name, owner_id, score_goal, time_limit, created_at) VALUES ($1,$2,$3,$4,$5,$6)',
+      [roomId, name, req.session.userId, scoreGoal, timeLimit, Date.now()]
+    );
     activeGames[roomId] = {
       gameState: null as any,
       config: {
@@ -376,14 +366,13 @@ app.post('/api/rooms/create', (req: any, res) => {
       kickVote: null,
       lastRoundShareDone: false
     };
-
     res.json({ roomId });
   } catch (e) {
     res.status(500).json({ error: 'Erro ao criar sala' });
   }
 });
 
-// --- SOCKET HANDLERS ---
+// ── Socket Handlers ──────────────────────────────────────────────────────────
 
 io.on('connection', (socket: any) => {
   const session = socket.request.session;
@@ -391,11 +380,8 @@ io.on('connection', (socket: any) => {
 
   const userId = session.userId;
 
-  socket.on('join_room', (roomId: string) => {
-    if (!activeGames[roomId]) {
-      socket.emit('error', 'Sala não encontrada');
-      return;
-    }
+  socket.on('join_room', async (roomId: string) => {
+    if (!activeGames[roomId]) { socket.emit('error', 'Sala não encontrada'); return; }
 
     const game = activeGames[roomId];
     socket.join(roomId);
@@ -414,9 +400,9 @@ io.on('connection', (socket: any) => {
     } else if (!alreadySpectator) {
       const emptySlot = game.slots.indexOf(null);
       try {
-        const row = db.prepare('SELECT nickname FROM users WHERE id = ?').get(userId) as any;
-        if (!row) return;
-        game.nicknames[userId] = row.nickname;
+        const { rows } = await pool.query('SELECT nickname FROM users WHERE id = $1', [userId]);
+        if (!rows[0]) return;
+        game.nicknames[userId] = rows[0].nickname;
         if (emptySlot !== -1) {
           game.slots[emptySlot] = userId;
           game.teams[userId] = (emptySlot % 2 === 0) ? 1 : 2;
@@ -425,17 +411,15 @@ io.on('connection', (socket: any) => {
             teams: game.teams, ownerId: game.ownerId, spectators: game.spectators
           });
         } else if (game.config.allowSpectators) {
-          game.spectators.push({ userId, nickname: row.nickname });
+          game.spectators.push({ userId, nickname: rows[0].nickname });
           io.to(roomId).emit('queue_updated', { spectators: game.spectators });
-          io.to(roomId).emit('system_message', `${row.nickname} entrou na fila (#${game.spectators.length}).`);
+          io.to(roomId).emit('system_message', `${rows[0].nickname} entrou na fila (#${game.spectators.length}).`);
         } else {
           socket.emit('error', 'Esta sala não permite espectadores.');
           socket.leave(roomId);
           return;
         }
-      } catch (e) {
-        return;
-      }
+      } catch (e) { return; }
     }
 
     const isUserSpectator = game.spectators.some(s => s.userId === userId);
@@ -443,35 +427,22 @@ io.on('connection', (socket: any) => {
     const filteredChat = game.chat.filter(m => m.channel === userChannel);
 
     socket.emit('init_sync', {
-      gameState: game.gameState,
-      config: game.config,
-      slots: game.slots,
-      nicknames: game.nicknames,
-      teams: game.teams,
-      ownerId: game.ownerId,
-      chat: filteredChat,
-      spectators: game.spectators,
-      userId: userId
+      gameState: game.gameState, config: game.config,
+      slots: game.slots, nicknames: game.nicknames, teams: game.teams,
+      ownerId: game.ownerId, chat: filteredChat, spectators: game.spectators, userId
     });
   });
 
-  socket.on('start_game', (roomId: string) => {
+  socket.on('start_game', async (roomId: string) => {
     const game = activeGames[roomId];
     if (!game) return;
-    if (game.ownerId !== userId) {
-      return socket.emit('error', 'Apenas o chefe da sala pode iniciar a partida.');
-    }
-    if (game.slots.filter(s => s !== null).length !== 4) {
-      return socket.emit('error', 'Necessário 4 jogadores para iniciar.');
-    }
+    if (game.ownerId !== userId) return socket.emit('error', 'Apenas o chefe da sala pode iniciar a partida.');
+    if (game.slots.filter(s => s !== null).length !== 4) return socket.emit('error', 'Necessário 4 jogadores para iniciar.');
 
     const userIds = game.slots as string[];
     const posMap: Record<string, number> = {};
     const teamMap: Record<string, 1 | 2> = {};
-    userIds.forEach((id, idx) => {
-      posMap[id] = idx;
-      teamMap[id] = (idx % 2 === 0) ? 1 : 2;
-    });
+    userIds.forEach((id, idx) => { posMap[id] = idx; teamMap[id] = (idx % 2 === 0) ? 1 : 2; });
 
     game.gameState = BiscaEngine.initGame(userIds, posMap, teamMap);
     game.gameState.status = 'SHUFFLING';
@@ -479,9 +450,8 @@ io.on('connection', (socket: any) => {
     game.sevenTrumpPlayed = false;
 
     io.to(roomId).emit('game_update', game.gameState);
-    try { db.prepare('UPDATE rooms SET status = ? WHERE id = ?').run('IN_GAME', roomId); } catch {}
+    try { await pool.query('UPDATE rooms SET status = $1 WHERE id = $2', ['IN_GAME', roomId]); } catch {}
 
-    // Shuffling animation delay
     setTimeout(() => {
       if (!activeGames[roomId] || !activeGames[roomId].gameState) return;
       const g = activeGames[roomId];
@@ -495,9 +465,7 @@ io.on('connection', (socket: any) => {
 
       const cuttingCards = [];
       const tempDeck = [...g.gameState.deck];
-      for (let i = 0; i < 5; i++) {
-        cuttingCards.push(tempDeck.pop()!);
-      }
+      for (let i = 0; i < 5; i++) cuttingCards.push(tempDeck.pop()!);
       g.gameState.cuttingCards = cuttingCards;
       g.gameState.deck = tempDeck;
 
@@ -506,7 +474,7 @@ io.on('connection', (socket: any) => {
     }, 2000);
   });
 
-  socket.on('select_corte', ({ roomId, cardId, isBater }: { roomId: string, cardId?: string, isBater?: boolean }) => {
+  socket.on('select_corte', async ({ roomId, cardId, isBater }: { roomId: string, cardId?: string, isBater?: boolean }) => {
     const game = activeGames[roomId];
     if (!game || !game.gameState || game.gameState.status !== 'CUTTING') return;
     if (game.gameState.cutterId !== userId) return;
@@ -524,7 +492,6 @@ io.on('connection', (socket: any) => {
       state.trumpSuit = card.suit;
       const isBisca = card.value === 'A' || card.value === '7';
       if (isBisca) {
-        // Bisca: nipe invertido, carta NÃO fica exposta — volta ao baralho
         state.trumpSuit = BiscaEngine.getSuitInversion(card.suit);
         state.visibleCorte = null;
       } else {
@@ -539,14 +506,11 @@ io.on('connection', (socket: any) => {
       const s = g.gameState;
 
       if (!s.isCopas) {
-        // Bisca (A ou 7 cortado): visibleCorte é null, carta retorna ao baralho (inclui cardId)
-        // Normal: visibleCorte está definido, cardId fica como corte exposto
         const isBiscaMode = !s.visibleCorte;
         s.deck.push(...s.cuttingCards.filter(c => isBiscaMode || c.id !== cardId));
         s.cuttingCards = [];
         s.deck = BiscaEngine.shuffle(s.deck);
         if (s.visibleCorte) {
-          // Coloca corte no fundo do baralho (index 0 = último a ser sacado com pop())
           const idx = s.deck.findIndex(c => c.id === s.visibleCorte!.id);
           if (idx !== -1) s.deck.splice(idx, 1);
           s.deck.unshift(s.visibleCorte);
@@ -572,10 +536,7 @@ io.on('connection', (socket: any) => {
 
         let dealStep = 0;
         const dealInterval = setInterval(() => {
-          if (!activeGames[roomId] || !activeGames[roomId].gameState) {
-            clearInterval(dealInterval);
-            return;
-          }
+          if (!activeGames[roomId] || !activeGames[roomId].gameState) { clearInterval(dealInterval); return; }
           const currState = activeGames[roomId].gameState;
           const targetIdx = (startIdx + dealStep) % 4;
           const targetUserId = g2.slots[targetIdx]!;
@@ -583,7 +544,6 @@ io.on('connection', (socket: any) => {
           const card = currState.deck.pop()!;
           currState.players[targetUserId].hand.push(card);
           currState.lastDealtUserId = targetUserId;
-
           io.to(roomId).emit('game_update', currState);
 
           dealStep++;
@@ -594,7 +554,6 @@ io.on('connection', (socket: any) => {
             currState.currentTurn = g2.slots[startIdx]!;
             io.to(roomId).emit('game_update', currState);
             io.to(roomId).emit('system_message', `Cartas dadas! Começa ${g2.nicknames[currState.currentTurn]}.`);
-            // Notificar player que tem o 2 do corte (pode trocar na 1ª rodada)
             if (currState.visibleCorte && !currState.isCopas && !currState.corteSwapDone) {
               const corteSuit = currState.visibleCorte.suit;
               for (const pid of g2.slots) {
@@ -644,9 +603,7 @@ io.on('connection', (socket: any) => {
       game.gameState.status = 'CUTTING';
 
       const cuttingCards = [];
-      for (let i = 0; i < 5; i++) {
-        cuttingCards.push(game.gameState.deck.pop()!);
-      }
+      for (let i = 0; i < 5; i++) cuttingCards.push(game.gameState.deck.pop()!);
       game.gameState.cuttingCards = cuttingCards;
 
       io.to(roomId).emit('game_update', game.gameState);
@@ -654,7 +611,7 @@ io.on('connection', (socket: any) => {
     }, 2000);
   };
 
-  const doQueueSwap = (roomId: string, losingTeam: 1 | 2) => {
+  const doQueueSwap = async (roomId: string, losingTeam: 1 | 2) => {
     const game = activeGames[roomId];
     if (!game) return;
 
@@ -664,10 +621,9 @@ io.on('connection', (socket: any) => {
 
     const specs = game.spectators;
 
-    const finalize = () => {
+    const finalize = async () => {
       game.gameState = null as any;
-      try { db.prepare('UPDATE rooms SET status = ? WHERE id = ?').run('WAITING', roomId); } catch {}
-      // Limpa o estado do jogo nos clientes → volta para sala de espera
+      try { await pool.query('UPDATE rooms SET status = $1 WHERE id = $2', ['WAITING', roomId]); } catch {}
       io.to(roomId).emit('game_reset');
       io.to(roomId).emit('room_update', {
         slots: game.slots, nicknames: game.nicknames,
@@ -684,8 +640,7 @@ io.on('connection', (socket: any) => {
     if (specs.length === 1) {
       setTimeout(() => {
         io.to(roomId).emit('spectator_choose_replacement', {
-          spectatorId: specs[0].userId,
-          spectatorNickname: specs[0].nickname,
+          spectatorId: specs[0].userId, spectatorNickname: specs[0].nickname,
           losingTeam,
           candidates: losingSlots.map(s => ({ userId: s.uid, nickname: game.nicknames[s.uid] }))
         });
@@ -694,7 +649,7 @@ io.on('connection', (socket: any) => {
     }
 
     // 2+ espectadores: dupla inteira sai
-    setTimeout(() => {
+    setTimeout(async () => {
       const incoming = specs.splice(0, 2);
       for (let i = 0; i < losingSlots.length; i++) {
         const lp = losingSlots[i];
@@ -709,12 +664,12 @@ io.on('connection', (socket: any) => {
       }
       const outNames = losingSlots.map(s => game.nicknames[s.uid] || '').join(' e ');
       const inNames = incoming.map(i => i.nickname).join(' e ');
-      finalize();
+      await finalize();
       io.to(roomId).emit('system_message', `${outNames} saíram. ${inNames} entram no jogo!`);
     }, 4000);
   };
 
-  socket.on('spectator_remove_player', ({ roomId, removeUserId }: { roomId: string; removeUserId: string }) => {
+  socket.on('spectator_remove_player', async ({ roomId, removeUserId }: { roomId: string; removeUserId: string }) => {
     const game = activeGames[roomId];
     if (!game) return;
     if (game.spectators.length === 0 || game.spectators[0].userId !== userId) return;
@@ -732,7 +687,8 @@ io.on('connection', (socket: any) => {
     delete game.teams[removeUserId];
 
     game.gameState = null as any;
-    try { db.prepare('UPDATE rooms SET status = ? WHERE id = ?').run('WAITING', roomId); } catch {}
+    try { await pool.query('UPDATE rooms SET status = $1 WHERE id = $2', ['WAITING', roomId]); } catch {}
+    io.to(roomId).emit('game_reset');
     io.to(roomId).emit('room_update', {
       slots: game.slots, nicknames: game.nicknames,
       teams: game.teams, ownerId: game.ownerId, spectators: game.spectators
@@ -745,11 +701,7 @@ io.on('connection', (socket: any) => {
     const game = activeGames[roomId];
     if (!game) return;
     if (!game.slots.includes(userId)) return;
-
-    if (game.kickVote) {
-      socket.emit('error', 'Já há uma votação em andamento.');
-      return;
-    }
+    if (game.kickVote) { socket.emit('error', 'Já há uma votação em andamento.'); return; }
 
     const targetInSlot = game.slots.includes(targetId);
     const targetIsSpec = game.spectators.some(s => s.userId === targetId);
@@ -766,13 +718,10 @@ io.on('connection', (socket: any) => {
     }, 30000);
 
     game.kickVote = { targetId, targetNickname, initiatorId: userId, votes: [userId], timer };
-
-    io.to(roomId).emit('kick_vote_started', {
-      targetId, targetNickname, initiatorId: userId, initiatorNickname, votes: [userId]
-    });
+    io.to(roomId).emit('kick_vote_started', { targetId, targetNickname, initiatorId: userId, initiatorNickname, votes: [userId] });
   });
 
-  socket.on('cast_kick_vote', ({ roomId, approve }: { roomId: string; approve: boolean }) => {
+  socket.on('cast_kick_vote', async ({ roomId, approve }: { roomId: string; approve: boolean }) => {
     const game = activeGames[roomId];
     if (!game || !game.kickVote) return;
     if (!game.slots.includes(userId)) return;
@@ -802,7 +751,7 @@ io.on('connection', (socket: any) => {
         delete game.teams[targetId];
         if (game.gameState && !['WAITING', 'FINISHED'].includes(game.gameState.status)) {
           game.gameState = null as any;
-          try { db.prepare('UPDATE rooms SET status = ? WHERE id = ?').run('WAITING', roomId); } catch {}
+          try { await pool.query('UPDATE rooms SET status = $1 WHERE id = $2', ['WAITING', roomId]); } catch {}
           io.to(roomId).emit('game_aborted', { reason: `${targetNickname} foi removido por votação.` });
         }
       } else {
@@ -872,14 +821,12 @@ io.on('connection', (socket: any) => {
     const card = player.hand[cardIdx];
 
     // --- REGRA: Ás do corte antes do 7 do corte ---
-    // Exceção: jogador tem AMBOS (pode jogar o Ás; o 7 é revelado a todos)
     if (card.suit === state.trumpSuit && card.value === 'A' && !game.sevenTrumpPlayed && state.deck.length > 0) {
       const trumpSevenEntry = player.hand.find((c, i) => i !== cardIdx && c.suit === state.trumpSuit && c.value === '7');
       if (player.hand.length > 1 && !trumpSevenEntry) {
         socket.emit('error', 'O Ás do corte não pode ser jogado antes do 7 do corte!');
         return;
       }
-      // Tem ambos: revela o 7 após o Ás se estabelecer na mesa (~1s)
       if (trumpSevenEntry) {
         const capturedSeven = trumpSevenEntry;
         setTimeout(() => {
@@ -893,23 +840,21 @@ io.on('connection', (socket: any) => {
     // --- REGRA: 7 do corte não pode sair de fundo (último da rodada) ---
     // Exceção 1: tem o Ás do corte na mão (animação especial de revelação)
     // Exceção 2: é a ÚLTIMA rodada absoluta (jogador tem somente 1 carta na mão)
-    // Outros 7 e ÁS (de outros naipes) podem ser jogados normalmente.
     let sevenFundoAceCard: Card | null = null;
     if (card.suit === state.trumpSuit && card.value === '7' && state.vaza.length === 3) {
       const aceEntry = player.hand.find((c, i) => i !== cardIdx && c.suit === state.trumpSuit && c.value === 'A');
-      const isPlayerLastCard = player.hand.length === 1; // única carta — obrigado a jogar
+      const isPlayerLastCard = player.hand.length === 1;
       if (!isPlayerLastCard && !aceEntry) {
         socket.emit('error', 'O 7 do corte não pode ser o último jogado na rodada!');
         return;
       }
-      if (aceEntry) sevenFundoAceCard = aceEntry; // revelado após a vaza
+      if (aceEntry) sevenFundoAceCard = aceEntry;
     }
 
     // --- Marcar 7 do corte jogado + revelar Ás se NÃO for fundo ---
     if (card.suit === state.trumpSuit && card.value === '7') {
       game.sevenTrumpPlayed = true;
       if (!sevenFundoAceCard) {
-        // fundo trata a revelação com animação especial; aqui só o caso normal
         const hasTrumpAce = player.hand.some((c, i) => i !== cardIdx && c.suit === state.trumpSuit && c.value === 'A');
         if (hasTrumpAce) io.to(roomId).emit('trump_ace_reveal', { userId, nickname: game.nicknames[userId] });
       }
@@ -928,7 +873,7 @@ io.on('connection', (socket: any) => {
       state.currentTurn = winnerId;
       const vazaCards = state.vaza.map(v => v.card);
 
-      // --- HELAY: 7 e Ás do trunfo na mesma vaza, Ás DEPOIS do 7, times DIFERENTES ---
+      // --- HELAY ---
       const sevenEntry = state.vaza.find(v => v.card.suit === state.trumpSuit && v.card.value === '7');
       const aceEntry   = state.vaza.find(v => v.card.suit === state.trumpSuit && v.card.value === 'A');
       const sevenPos   = state.vaza.findIndex(v => v.card.suit === state.trumpSuit && v.card.value === '7');
@@ -944,12 +889,10 @@ io.on('connection', (socket: any) => {
       }
 
       state.players[winnerId].vazaPoints += BiscaEngine.calculateHandPoints(vazaCards);
-
-      // Emite vaza resolvida + estado (cartas ficam visíveis antes de sair)
       io.to(roomId).emit('vaza_resolved', { winnerId, vaza: state.vaza });
       io.to(roomId).emit('game_update', state);
 
-      // 7 de fundo com Ás: revela o Ás com animação após as cartas estarem na mesa
+      // 7 de fundo com Ás: revela o Ás com animação
       if (sevenFundoAceCard) {
         const capturedAce = sevenFundoAceCard;
         setTimeout(() => {
@@ -961,7 +904,7 @@ io.on('connection', (socket: any) => {
         }, 700);
       }
 
-      setTimeout(() => {
+      setTimeout(async () => {
         if (!activeGames[roomId] || !activeGames[roomId].gameState) return;
         const g = activeGames[roomId];
         const s = g.gameState;
@@ -972,7 +915,7 @@ io.on('connection', (socket: any) => {
         const winIdx = g.slots.indexOf(winnerId);
         const deckBefore = s.deck.length;
 
-        // Animar distribuição pós-vaza (evento para o cliente)
+        // Animar distribuição pós-vaza
         if (deckBefore > 0) {
           const dealCount = Math.min(deckBefore, 4);
           const dealOrder = Array.from({ length: dealCount }, (_, i) => g.slots[(winIdx + i) % 4]);
@@ -995,7 +938,6 @@ io.on('connection', (socket: any) => {
               s.players[g.slots[(winIdx + i) % 4] as string].hand.push(s.deck.pop()!);
             }
           }
-          // Limpar visibleCorte se o baralho acabou (carta já foi para a mão)
           if (s.deck.length === 0 && s.visibleCorte) s.visibleCorte = null;
         }
 
@@ -1004,7 +946,7 @@ io.on('connection', (socket: any) => {
         if (allHaveThree && s.deck.length === 0 && !g.lastRoundShareDone) {
           g.lastRoundShareDone = true;
           const savedTurn = s.currentTurn;
-          s.currentTurn = 'SHARING'; // bloqueia jogadas durante a troca
+          s.currentTurn = 'SHARING';
           io.to(roomId).emit('game_update', s);
 
           for (let i = 0; i < 4; i++) {
@@ -1016,13 +958,11 @@ io.on('connection', (socket: any) => {
             if (sid) {
               io.to(sid).emit('last_round_card_share', {
                 partnerCards: s.players[partnerId].hand,
-                partnerId,
-                partnerNickname: g.nicknames[partnerId]
+                partnerId, partnerNickname: g.nicknames[partnerId]
               });
             }
           }
 
-          // Retomar após a animação (~8.5s): 1s envio + 5s visualização + 1s retorno + folga
           setTimeout(() => {
             if (!activeGames[roomId] || !activeGames[roomId].gameState) return;
             activeGames[roomId].gameState.currentTurn = savedTurn;
@@ -1040,11 +980,11 @@ io.on('connection', (socket: any) => {
           const handWinner: 1 | 2 = t1Pts >= t2Pts ? 1 : 2;
           const loserPts = handWinner === 1 ? t2Pts : t1Pts;
           const isCapote = loserPts <= 30;
-          // Regra 59x61: se o resultado for exatamente 59 vs 61, o vencedor leva 2 gols (dobrado)
+          // Regra 59x61: resultado apertado → ponto duplo
           const isCloseCall = !isCapote && ((t1Pts === 59 && t2Pts === 61) || (t1Pts === 61 && t2Pts === 59));
           let pts = s.isCopas ? 2 : 1;
           if (isCapote) pts = s.isCopas ? 3 : 2;
-          if (isCloseCall) pts = s.isCopas ? 4 : 2; // 59x61 = ponto duplo
+          if (isCloseCall) pts = s.isCopas ? 4 : 2;
           if (handWinner === 1) s.gameScore.team1 += pts;
           else s.gameScore.team2 += pts;
 
@@ -1058,7 +998,7 @@ io.on('connection', (socket: any) => {
           if (s.gameScore.team1 >= g.config.scoreGoal || s.gameScore.team2 >= g.config.scoreGoal) {
             s.status = 'FINISHED';
             const matchWinner: 1 | 2 = s.gameScore.team1 >= g.config.scoreGoal ? 1 : 2;
-            try { db.prepare('UPDATE rooms SET status = ? WHERE id = ?').run('FINISHED', roomId); } catch {}
+            try { await pool.query('UPDATE rooms SET status = $1 WHERE id = $2', ['FINISHED', roomId]); } catch {}
             io.to(roomId).emit('game_finished', { winnerTeam: matchWinner });
             doQueueSwap(roomId, matchWinner === 1 ? 2 : 1);
           } else {
@@ -1068,7 +1008,7 @@ io.on('connection', (socket: any) => {
           io.to(roomId).emit('game_update', s);
         }
       }, sevenFundoAceCard ? 4500 : 2500);
-      return; // game_update já foi emitido acima
+      return;
     }
 
     io.to(roomId).emit('game_update', state);
@@ -1079,14 +1019,10 @@ io.on('connection', (socket: any) => {
     if (!game || !text.trim()) return;
 
     const channel: 'players' | 'spectators' = game.spectators.some(s => s.userId === userId) ? 'spectators' : 'players';
-
     const message: ChatMessage = {
-      id: uuidv4(),
-      userId,
+      id: uuidv4(), userId,
       nickname: game.nicknames[userId] || 'Sistema',
-      text: text.slice(0, 200),
-      timestamp: Date.now(),
-      channel
+      text: text.slice(0, 200), timestamp: Date.now(), channel
     };
 
     game.chat.push(message);
@@ -1106,7 +1042,6 @@ io.on('connection', (socket: any) => {
     const game = activeGames[roomId];
     if (!game || !game.gameState) return;
     if (game.gameState.roundCount > 0 || game.gameState.vaza.length > 0) return;
-
     game.gameState.isCopas = true;
     game.gameState.trumpSuit = 'Copas';
     io.to(roomId).emit('system_message', `${game.nicknames[userId]} BATEU EM COPAS! Mão vale dobrado.`);
@@ -1131,16 +1066,14 @@ io.on('connection', (socket: any) => {
       state.corteSwapDone = true;
 
       const deckIdx = state.deck.findIndex(c => c.id === oldCorte.id);
-      if (deckIdx !== -1) {
-        state.deck[deckIdx] = twoCard;
-      }
+      if (deckIdx !== -1) state.deck[deckIdx] = twoCard;
 
       io.to(roomId).emit('system_message', `${game.nicknames[userId]} trocou o 2 pela carta do corte.`);
       io.to(roomId).emit('game_update', state);
     }
   });
 
-  socket.on('leave_room', (roomId: string) => {
+  socket.on('leave_room', async (roomId: string) => {
     const game = activeGames[roomId];
     if (!game) return;
 
@@ -1150,7 +1083,7 @@ io.on('connection', (socket: any) => {
       delete game.nicknames[userId];
       delete game.teams[userId];
       socket.leave(roomId);
-      cleanupRoom(roomId, io);
+      await cleanupRoom(roomId, io);
       io.to(roomId).emit('system_message', `${session.username} saiu da sala.`);
     } else {
       const specIdx = game.spectators.findIndex(s => s.userId === userId);
@@ -1164,7 +1097,7 @@ io.on('connection', (socket: any) => {
     }
   });
 
-  socket.on('disconnect', () => {
+  socket.on('disconnect', async () => {
     delete userSockets[userId];
     for (const roomId in activeGames) {
       const game = activeGames[roomId];
@@ -1182,53 +1115,54 @@ io.on('connection', (socket: any) => {
       }
       if (game.slots.includes(userId)) {
         if (game.gameState && game.gameState.status === 'IN_GAME') {
-          io.to(roomId).emit('player_disconnected', {
-            nickname: game.nicknames[userId] || 'Jogador',
-            timeout: 30000
-          });
+          io.to(roomId).emit('player_disconnected', { nickname: game.nicknames[userId] || 'Jogador', timeout: 30000 });
 
-          game.reconnectionTimers[userId] = setTimeout(() => {
+          game.reconnectionTimers[userId] = setTimeout(async () => {
             io.to(roomId).emit('game_aborted', { reason: 'Jogador abandonou a partida.' });
             game.gameState = null as any;
-            try { db.prepare('UPDATE rooms SET status = ? WHERE id = ?').run('WAITING', roomId); } catch {}
+            try { await pool.query('UPDATE rooms SET status = $1 WHERE id = $2', ['WAITING', roomId]); } catch {}
 
             const idx = game.slots.indexOf(userId);
             if (idx !== -1) game.slots[idx] = null;
-            cleanupRoom(roomId, io);
+            await cleanupRoom(roomId, io);
           }, 30000);
         } else {
           const idx = game.slots.indexOf(userId);
           game.slots[idx] = null;
           delete game.nicknames[userId];
           delete game.teams[userId];
-
-          cleanupRoom(roomId, io);
+          await cleanupRoom(roomId, io);
         }
       }
     }
   });
 });
 
-// Vite middleware for development
-if (process.env.NODE_ENV !== "production") {
+// ── Vite / Static ────────────────────────────────────────────────────────────
+
+if (process.env.NODE_ENV !== 'production') {
   (async () => {
-    const { createServer: createViteServer } = await import("vite");
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
     app.use(vite.middlewares);
   })();
 } else {
   const distPath = path.join(process.cwd(), 'dist');
   app.use(express.static(distPath));
-  app.get('*all', (req, res) => {
-    res.sendFile(path.join(distPath, 'index.html'));
-  });
+  app.get('*all', (req, res) => res.sendFile(path.join(distPath, 'index.html')));
 }
+
+// ── Start ────────────────────────────────────────────────────────────────────
 
 const PORT = Number(process.env.PORT) || 3000;
 
-httpServer.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-});
+initDB()
+  .then(() => {
+    httpServer.listen(PORT, '0.0.0.0', () => {
+      console.log(`Server running on http://localhost:${PORT}`);
+    });
+  })
+  .catch(err => {
+    console.error('Failed to initialize database:', err);
+    process.exit(1);
+  });
