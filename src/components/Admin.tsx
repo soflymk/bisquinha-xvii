@@ -1,12 +1,14 @@
 import { useState, useEffect, FormEvent } from 'react';
 import { useApp } from '../App';
 import { motion, AnimatePresence } from 'motion/react';
-import { ShieldCheck, UserMinus, UserPlus, Search, Crown, Key, X, Trash2 } from 'lucide-react';
+import { ShieldCheck, UserMinus, UserPlus, Search, Crown, Key, X, Trash2, Bot } from 'lucide-react';
 
 export default function Admin() {
-  const [activeTab, setActiveTab] = useState<'USERS' | 'ROOMS'>('USERS');
+  const [activeTab, setActiveTab] = useState<'USERS' | 'ROOMS' | 'BOTS'>('USERS');
   const [users, setUsers] = useState<any[]>([]);
   const [rooms, setRooms] = useState<any[]>([]);
+  const [botNames, setBotNames] = useState<{ id: string; name: string }[]>([]);
+  const [newBotName, setNewBotName] = useState('');
   const [searchTerm, setSearchTerm] = useState('');
   const [filter, setFilter] = useState<'ALL' | 'ACTIVE' | 'INACTIVE'>('ALL');
   const [resetModal, setResetModal] = useState<{ id: string, name: string } | null>(null);
@@ -37,9 +39,53 @@ export default function Admin() {
     }
   };
 
+  const fetchBotNames = async () => {
+    try {
+      const res = await fetch('/api/admin/bot-names');
+      if (!res.ok) return;
+      const data = await res.json();
+      setBotNames(data || []);
+    } catch (e) {
+      console.error('Failed to fetch bot names:', e);
+    }
+  };
+
+  const handleAddBotName = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!newBotName.trim()) return;
+    const res = await fetch('/api/admin/bot-names/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: newBotName.trim() })
+    });
+    if (res.ok) {
+      setNewBotName('');
+      fetchBotNames();
+    } else {
+      const data = await res.json();
+      alert(data.error || 'Erro ao criar nome de bot');
+    }
+  };
+
+  const handleDeleteBotName = async (id: string) => {
+    if (!confirm('Remover este nome de bot?')) return;
+    const res = await fetch('/api/admin/bot-names/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id })
+    });
+    if (res.ok) {
+      fetchBotNames();
+    } else {
+      const data = await res.json();
+      alert(data.error || 'Erro ao remover nome de bot');
+    }
+  };
+
   useEffect(() => {
     if (activeTab === 'USERS') fetchUsers();
-    else fetchRooms();
+    else if (activeTab === 'ROOMS') fetchRooms();
+    else fetchBotNames();
   }, [activeTab]);
 
   const toggleUser = async (userId: string, currentActive: boolean) => {
@@ -144,13 +190,13 @@ export default function Admin() {
 
         <div className="flex flex-wrap gap-2 md:gap-4 items-center">
           <div className="flex bg-slate-800 p-1 rounded-xl md:rounded-2xl border border-slate-700 shadow-xl w-full md:w-auto">
-             {(['USERS', 'ROOMS'] as const).map(t => (
-               <button 
+             {(['USERS', 'ROOMS', 'BOTS'] as const).map(t => (
+               <button
                 key={t}
                 onClick={() => setActiveTab(t)}
                 className={`flex-1 md:flex-none px-4 md:px-8 py-3 rounded-lg md:rounded-xl text-[9px] md:text-[10px] font-black uppercase tracking-widest transition-all ${activeTab === t ? 'bg-slate-700 text-white border border-slate-600' : 'text-slate-500 hover:text-slate-200'}`}
                >
-                  {t === 'USERS' ? 'Usuários' : 'Salas'}
+                  {t === 'USERS' ? 'Usuários' : t === 'ROOMS' ? 'Salas' : '🤖 Bots'}
                </button>
              ))}
           </div>
@@ -282,7 +328,7 @@ export default function Admin() {
               )}
             </div>
           </>
-        ) : (
+        ) : activeTab === 'ROOMS' ? (
           <div className="overflow-x-auto">
             <table className="w-full text-left border-collapse">
               <thead>
@@ -318,7 +364,7 @@ export default function Admin() {
                       Meta: {r.score_goal} Pontos
                     </td>
                     <td className="px-8 py-6 text-right">
-                      <button 
+                      <button
                         onClick={() => closeRoom(r.id)}
                         className="p-3 transition rounded-xl border border-red-500/20 text-red-400 hover:bg-red-500/10"
                         title="Encerrar Sala"
@@ -330,11 +376,69 @@ export default function Admin() {
                 ))}
               </tbody>
             </table>
-            
+
             {rooms.length === 0 && (
               <div className="p-24 text-center">
                 <ShieldCheck size={48} className="mx-auto text-slate-800 mb-4" />
                 <p className="text-slate-500 font-bold uppercase tracking-widest text-sm italic">Nenhuma sala ativa detectada pelos radares.</p>
+              </div>
+            )}
+          </div>
+        ) : (
+          /* Aba BOTS */
+          <div className="p-8">
+            <div className="flex items-center gap-3 mb-6">
+              <Bot size={22} className="text-amber-400" />
+              <h3 className="text-lg font-black text-white uppercase italic">Nomes dos Bots</h3>
+              <span className="text-[9px] font-black text-amber-500 bg-amber-900/30 px-2 py-0.5 rounded-full border border-amber-500/30">
+                {botNames.length} nomes
+              </span>
+            </div>
+
+            {/* Formulário para adicionar */}
+            <form onSubmit={handleAddBotName} className="flex gap-3 mb-8">
+              <input
+                type="text"
+                placeholder="Nome do bot (sem BOT_ — será adicionado automaticamente)"
+                value={newBotName}
+                onChange={e => setNewBotName(e.target.value)}
+                className="flex-1 bg-slate-900 border-2 border-slate-700 rounded-2xl py-3 px-5 text-white font-bold focus:outline-none focus:border-amber-500 transition-all placeholder:text-slate-600 text-sm"
+              />
+              <button
+                type="submit"
+                className="bg-amber-600 hover:bg-amber-500 text-white font-black py-3 px-6 rounded-2xl transition-all shadow-lg uppercase text-[10px] tracking-widest whitespace-nowrap"
+              >
+                Adicionar
+              </button>
+            </form>
+
+            {/* Lista de nomes */}
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+              {botNames.map(bn => (
+                <div key={bn.id}
+                  className="flex items-center justify-between bg-slate-900 border border-slate-700 rounded-2xl px-5 py-4 group hover:border-amber-500/30 transition-colors">
+                  <div className="flex items-center gap-3">
+                    <span className="text-lg">🤖</span>
+                    <div>
+                      <span className="font-black text-amber-400 text-sm">{bn.name}</span>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => handleDeleteBotName(bn.id)}
+                    disabled={botNames.length <= 2}
+                    className="p-2 text-slate-600 hover:text-red-400 hover:bg-red-500/10 rounded-xl border border-transparent hover:border-red-500/20 transition disabled:opacity-30 disabled:cursor-not-allowed"
+                    title={botNames.length <= 2 ? 'Mínimo de 2 nomes necessário' : 'Remover'}
+                  >
+                    <Trash2 size={16} />
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            {botNames.length === 0 && (
+              <div className="p-16 text-center">
+                <Bot size={48} className="mx-auto text-slate-800 mb-4" />
+                <p className="text-slate-500 font-bold uppercase tracking-widest text-sm italic">Nenhum nome de bot cadastrado.</p>
               </div>
             )}
           </div>

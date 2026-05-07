@@ -9,6 +9,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { Pool } from 'pg';
 import { BiscaEngine } from './src/lib/engine';
 import { Card, GameState, RoomStatus, User, Suit, ChatMessage } from './src/lib/types';
+import { chooseBotCard, chooseBotCorte, shouldBotSwap2, shouldBotBaterCopas, BotLevel } from './src/lib/botEngine';
 
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
@@ -45,7 +46,21 @@ const initDB = async () => {
       status      TEXT NOT NULL DEFAULT 'WAITING',
       created_at  BIGINT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS bot_names (
+      id   TEXT PRIMARY KEY,
+      name TEXT UNIQUE NOT NULL
+    );
   `);
+
+  // Inserir nomes iniciais de bots se não existirem
+  const initialBotNames = ['BOT_Onço', 'BOT_Índio', 'BOT_Cajor', 'BOT_7Pele', 'BOT_Mamacita', 'BOT_Filhota'];
+  for (const name of initialBotNames) {
+    const id = name.toLowerCase().replace(/[^a-z0-9]/g, '_');
+    await pool.query(
+      'INSERT INTO bot_names (id, name) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [id, name]
+    );
+  }
 
   console.log('Cleaning up orphaned rooms...');
   await pool.query("DELETE FROM rooms WHERE status != 'FINISHED'");
@@ -113,6 +128,9 @@ const activeGames: Record<string, {
   spectators: { userId: string; nickname: string }[];
   kickVote: { targetId: string; targetNickname: string; initiatorId: string; votes: string[]; timer: NodeJS.Timeout } | null;
   lastRoundShareDone: boolean;
+  bots: Set<string>;
+  botLevel: BotLevel;
+  playedCards: Card[];
 }> = {};
 
 // ── Helper: limpar sala vazia ────────────────────────────────────────────────
@@ -128,12 +146,17 @@ const cleanupRoom = async (roomId: string, io: Server) => {
     io.emit('rooms_updated');
   } else {
     if (!game.slots.includes(game.ownerId)) {
-      const nextOwner = game.slots.find(s => s !== null);
+      const nextOwner = game.slots.find(s => s !== null && !s.startsWith('bot-'));
       if (nextOwner) game.ownerId = nextOwner;
+      else {
+        const anyOwner = game.slots.find(s => s !== null);
+        if (anyOwner) game.ownerId = anyOwner;
+      }
     }
     io.to(roomId).emit('room_update', {
       slots: game.slots, nicknames: game.nicknames,
-      teams: game.teams, ownerId: game.ownerId, spectators: game.spectators
+      teams: game.teams, ownerId: game.ownerId, spectators: game.spectators,
+      bots: [...game.bots]
     });
   }
 };
@@ -287,6 +310,48 @@ app.post('/api/me/update-nickname', async (req: any, res) => {
   }
 });
 
+// Bot Names
+app.get('/api/admin/bot-names', async (req: any, res) => {
+  if (req.session.role !== 'ADMIN') return res.status(403).json({ error: 'Acesso negado' });
+  try {
+    const { rows } = await pool.query('SELECT id, name FROM bot_names ORDER BY name ASC');
+    res.json(rows || []);
+  } catch (e) {
+    res.status(500).json({ error: 'Erro ao buscar nomes de bots' });
+  }
+});
+
+app.post('/api/admin/bot-names/create', async (req: any, res) => {
+  if (req.session.role !== 'ADMIN') return res.status(403).json({ error: 'Acesso negado' });
+  let { name } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ error: 'Nome obrigatório' });
+  name = name.trim();
+  if (!name.startsWith('BOT_')) name = `BOT_${name}`;
+  const id = `bot_name_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  try {
+    await pool.query('INSERT INTO bot_names (id, name) VALUES ($1, $2)', [id, name]);
+    res.json({ success: true, id, name });
+  } catch (e: any) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Nome já existe' });
+    res.status(500).json({ error: 'Erro ao criar nome de bot' });
+  }
+});
+
+app.post('/api/admin/bot-names/delete', async (req: any, res) => {
+  if (req.session.role !== 'ADMIN') return res.status(403).json({ error: 'Acesso negado' });
+  const { id } = req.body;
+  if (!id) return res.status(400).json({ error: 'ID obrigatório' });
+  try {
+    const { rows } = await pool.query('SELECT COUNT(*) AS cnt FROM bot_names');
+    const count = parseInt(rows[0].cnt, 10);
+    if (count <= 2) return res.status(400).json({ error: 'Mínimo de 2 nomes de bots é necessário' });
+    await pool.query('DELETE FROM bot_names WHERE id = $1', [id]);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Erro ao deletar nome de bot' });
+  }
+});
+
 // Admin Rooms
 app.get('/api/admin/rooms/active', async (req: any, res) => {
   if (req.session.role !== 'ADMIN') return res.status(403).json({ error: 'Acesso negado' });
@@ -364,7 +429,10 @@ app.post('/api/rooms/create', async (req: any, res) => {
       sevenTrumpPlayed: false,
       spectators: [],
       kickVote: null,
-      lastRoundShareDone: false
+      lastRoundShareDone: false,
+      bots: new Set<string>(),
+      botLevel: 'basic',
+      playedCards: []
     };
     res.json({ roomId });
   } catch (e) {
@@ -408,7 +476,8 @@ io.on('connection', (socket: any) => {
           game.teams[userId] = (emptySlot % 2 === 0) ? 1 : 2;
           io.to(roomId).emit('room_update', {
             slots: game.slots, nicknames: game.nicknames,
-            teams: game.teams, ownerId: game.ownerId, spectators: game.spectators
+            teams: game.teams, ownerId: game.ownerId, spectators: game.spectators,
+            bots: [...game.bots]
           });
         } else if (game.config.allowSpectators) {
           game.spectators.push({ userId, nickname: rows[0].nickname });
@@ -429,7 +498,8 @@ io.on('connection', (socket: any) => {
     socket.emit('init_sync', {
       gameState: game.gameState, config: game.config,
       slots: game.slots, nicknames: game.nicknames, teams: game.teams,
-      ownerId: game.ownerId, chat: filteredChat, spectators: game.spectators, userId
+      ownerId: game.ownerId, chat: filteredChat, spectators: game.spectators, userId,
+      bots: [...game.bots], botLevel: game.botLevel
     });
   });
 
@@ -471,6 +541,7 @@ io.on('connection', (socket: any) => {
 
       io.to(roomId).emit('game_update', g.gameState);
       io.to(roomId).emit('system_message', `${g.nicknames[cutterId]} está cortando o baralho.`);
+      scheduleBotIfNeeded(roomId);
     }, 2000);
   });
 
@@ -560,12 +631,37 @@ io.on('connection', (socket: any) => {
                 if (!pid) continue;
                 const twoCard = currState.players[pid].hand.find(c => c.value === '2' && c.suit === corteSuit);
                 if (twoCard) {
-                  const sid = userSockets[pid];
-                  if (sid) io.to(sid).emit('trump_two_available', { corteCard: currState.visibleCorte, twoCard });
+                  if (g2.bots.has(pid)) {
+                    // Bot decide automaticamente trocar o 2
+                    if (shouldBotSwap2(currState.players[pid].hand, currState.visibleCorte!, g2.botLevel)) {
+                      setTimeout(() => {
+                        const gr = activeGames[roomId];
+                        if (!gr || !gr.gameState || gr.gameState.corteSwapDone) return;
+                        const st = gr.gameState;
+                        const pl = st.players[pid];
+                        const tidx = pl.hand.findIndex(c => c.value === '2' && c.suit === st.visibleCorte?.suit);
+                        if (tidx !== -1 && st.visibleCorte) {
+                          const tCard = pl.hand.splice(tidx, 1)[0];
+                          const oldCorte = st.visibleCorte;
+                          pl.hand.push(oldCorte);
+                          st.visibleCorte = tCard;
+                          st.corteSwapDone = true;
+                          const dkIdx = st.deck.findIndex(c => c.id === oldCorte.id);
+                          if (dkIdx !== -1) st.deck[dkIdx] = tCard;
+                          io.to(roomId).emit('system_message', `${gr.nicknames[pid]} (BOT) trocou o 2 pela carta do corte.`);
+                          io.to(roomId).emit('game_update', st);
+                        }
+                      }, 1200);
+                    }
+                  } else {
+                    const sid = userSockets[pid];
+                    if (sid) io.to(sid).emit('trump_two_available', { corteCard: currState.visibleCorte, twoCard });
+                  }
                   break;
                 }
               }
             }
+            scheduleBotIfNeeded(roomId);
           }
         }, 600);
       }, 400);
@@ -587,6 +683,7 @@ io.on('connection', (socket: any) => {
     state.status = 'SHUFFLING';
     game.sevenTrumpPlayed = false;
     game.lastRoundShareDone = false;
+    game.playedCards = [];
 
     for (const pid in state.players) {
       state.players[pid].hand = [];
@@ -608,6 +705,7 @@ io.on('connection', (socket: any) => {
 
       io.to(roomId).emit('game_update', game.gameState);
       io.to(roomId).emit('system_message', `${game.nicknames[cutterId]} está cortando o baralho.`);
+      scheduleBotIfNeeded(roomId);
     }, 2000);
   };
 
@@ -627,7 +725,8 @@ io.on('connection', (socket: any) => {
       io.to(roomId).emit('game_reset');
       io.to(roomId).emit('room_update', {
         slots: game.slots, nicknames: game.nicknames,
-        teams: game.teams, ownerId: game.ownerId, spectators: game.spectators
+        teams: game.teams, ownerId: game.ownerId, spectators: game.spectators,
+        bots: [...game.bots]
       });
       io.to(roomId).emit('queue_updated', { spectators: game.spectators });
     };
@@ -691,7 +790,8 @@ io.on('connection', (socket: any) => {
     io.to(roomId).emit('game_reset');
     io.to(roomId).emit('room_update', {
       slots: game.slots, nicknames: game.nicknames,
-      teams: game.teams, ownerId: game.ownerId, spectators: game.spectators
+      teams: game.teams, ownerId: game.ownerId, spectators: game.spectators,
+      bots: [...game.bots]
     });
     io.to(roomId).emit('queue_updated', { spectators: game.spectators });
     io.to(roomId).emit('system_message', `${spec.nickname} entrou no lugar de ${removedNick}.`);
@@ -769,7 +869,8 @@ io.on('connection', (socket: any) => {
       io.to(roomId).emit('kick_vote_result', { passed: true, targetId, targetNickname });
       io.to(roomId).emit('room_update', {
         slots: game.slots, nicknames: game.nicknames,
-        teams: game.teams, ownerId: game.ownerId, spectators: game.spectators
+        teams: game.teams, ownerId: game.ownerId, spectators: game.spectators,
+        bots: [...game.bots]
       });
       io.to(roomId).emit('queue_updated', { spectators: game.spectators });
     }
@@ -785,7 +886,7 @@ io.on('connection', (socket: any) => {
       game.slots[fromIdx] = null;
       game.slots[toIdx] = userId;
       game.teams[userId] = (toIdx % 2 === 0) ? 1 : 2;
-      io.to(roomId).emit('room_update', { slots: game.slots, nicknames: game.nicknames, teams: game.teams, ownerId: game.ownerId, spectators: game.spectators });
+      io.to(roomId).emit('room_update', { slots: game.slots, nicknames: game.nicknames, teams: game.teams, ownerId: game.ownerId, spectators: game.spectators, bots: [...game.bots] });
     } else {
       io.to(roomId).emit('swap_request_received', { from: userId, fromNickname: game.nicknames[userId], toIdx, toUserId: targetUserId });
     }
@@ -802,53 +903,49 @@ io.on('connection', (socket: any) => {
       game.slots[toIdx] = fromUserId;
       game.teams[userId] = (fromIdx % 2 === 0) ? 1 : 2;
       game.teams[fromUserId] = (toIdx % 2 === 0) ? 1 : 2;
-      io.to(roomId).emit('room_update', { slots: game.slots, nicknames: game.nicknames, teams: game.teams, ownerId: game.ownerId, spectators: game.spectators });
+      io.to(roomId).emit('room_update', { slots: game.slots, nicknames: game.nicknames, teams: game.teams, ownerId: game.ownerId, spectators: game.spectators, bots: [...game.bots] });
       io.to(roomId).emit('system_message', `${game.nicknames[userId]} e ${game.nicknames[fromUserId]} trocaram de lugar.`);
     }
   });
 
-  socket.on('play_card', ({ roomId, cardId }: { roomId: string, cardId: string }) => {
+  // ── processCardPlay: lógica compartilhada entre socket humano e bot ──────────
+  const processCardPlay = (roomId: string, playerId: string, cardId: string, emitError: (msg: string) => void) => {
     const game = activeGames[roomId];
     if (!game || !game.gameState) return;
     const state = game.gameState;
 
-    if (state.currentTurn !== userId) return;
+    if (state.currentTurn !== playerId) return;
 
-    const player = state.players[userId];
+    const player = state.players[playerId];
     const cardIdx = player.hand.findIndex(c => c.id === cardId);
     if (cardIdx === -1) return;
 
     const card = player.hand[cardIdx];
 
     // --- REGRA: Ás do corte antes do 7 do corte ---
-    // Bloqueado se o jogador tem 2+ cartas (não é a última rodada) e o 7 ainda não saiu.
-    // Exceção 1: jogador tem AMBOS (Ás + 7) — pode jogar o Ás e o 7 é revelado a todos.
-    // Exceção 2: jogador tem 1 carta (última rodada absoluta) — é obrigado a jogar o que tem.
     if (card.suit === state.trumpSuit && card.value === 'A' && !game.sevenTrumpPlayed && player.hand.length > 1) {
       const trumpSevenEntry = player.hand.find((c, i) => i !== cardIdx && c.suit === state.trumpSuit && c.value === '7');
       if (!trumpSevenEntry) {
-        socket.emit('error', 'O Ás do corte não pode ser jogado antes do 7 do corte!');
+        emitError('O Ás do corte não pode ser jogado antes do 7 do corte!');
         return;
       }
       if (trumpSevenEntry) {
         const capturedSeven = trumpSevenEntry;
         setTimeout(() => {
           if (activeGames[roomId]) {
-            io.to(roomId).emit('trump_seven_reveal', { userId, nickname: game.nicknames[userId], sevenCard: capturedSeven });
+            io.to(roomId).emit('trump_seven_reveal', { userId: playerId, nickname: game.nicknames[playerId], sevenCard: capturedSeven });
           }
         }, 1000);
       }
     }
 
-    // --- REGRA: 7 do corte não pode sair de fundo (último da rodada) ---
-    // Exceção 1: tem o Ás do corte na mão (animação especial de revelação)
-    // Exceção 2: é a ÚLTIMA rodada absoluta (jogador tem somente 1 carta na mão)
+    // --- REGRA: 7 do corte não pode sair de fundo ---
     let sevenFundoAceCard: Card | null = null;
     if (card.suit === state.trumpSuit && card.value === '7' && state.vaza.length === 3) {
       const aceEntry = player.hand.find((c, i) => i !== cardIdx && c.suit === state.trumpSuit && c.value === 'A');
       const isPlayerLastCard = player.hand.length === 1;
       if (!isPlayerLastCard && !aceEntry) {
-        socket.emit('error', 'O 7 do corte não pode ser o último jogado na rodada!');
+        emitError('O 7 do corte não pode ser o último jogado na rodada!');
         return;
       }
       if (aceEntry) sevenFundoAceCard = aceEntry;
@@ -859,14 +956,14 @@ io.on('connection', (socket: any) => {
       game.sevenTrumpPlayed = true;
       if (!sevenFundoAceCard) {
         const hasTrumpAce = player.hand.some((c, i) => i !== cardIdx && c.suit === state.trumpSuit && c.value === 'A');
-        if (hasTrumpAce) io.to(roomId).emit('trump_ace_reveal', { userId, nickname: game.nicknames[userId] });
+        if (hasTrumpAce) io.to(roomId).emit('trump_ace_reveal', { userId: playerId, nickname: game.nicknames[playerId] });
       }
     }
 
     player.hand.splice(cardIdx, 1);
-    state.vaza.push({ userId, card });
+    state.vaza.push({ userId: playerId, card });
 
-    const turnIdx = game.slots.indexOf(userId);
+    const turnIdx = game.slots.indexOf(playerId);
     const nextUserId = game.slots[(turnIdx + 1) % 4] as string;
     state.currentTurn = nextUserId;
 
@@ -875,6 +972,9 @@ io.on('connection', (socket: any) => {
       state.lastVazaWinner = winnerId;
       state.currentTurn = winnerId;
       const vazaCards = state.vaza.map(v => v.card);
+
+      // Rastrear cartas jogadas para IA avançada
+      game.playedCards.push(...vazaCards);
 
       // --- HELAY ---
       const sevenEntry = state.vaza.find(v => v.card.suit === state.trumpSuit && v.card.value === '7');
@@ -901,7 +1001,7 @@ io.on('connection', (socket: any) => {
         setTimeout(() => {
           if (activeGames[roomId]) {
             io.to(roomId).emit('trump_seven_fundo_ace_reveal', {
-              userId, nickname: game.nicknames[userId], aceCard: capturedAce
+              userId: playerId, nickname: game.nicknames[playerId], aceCard: capturedAce
             });
           }
         }, 700);
@@ -924,7 +1024,6 @@ io.on('connection', (socket: any) => {
           const dealOrder = Array.from({ length: dealCount }, (_, i) => g.slots[(winIdx + i) % 4]);
           io.to(roomId).emit('post_vaza_deal_sequence', { dealOrder });
 
-          // Carta do corte vai para um jogador? Só anima na ÚLTIMA distribuição (≤4 cartas no baralho)
           if (s.visibleCorte && s.deck[0]?.id === s.visibleCorte.id && deckBefore <= 4) {
             const corteRecipIdx = (winIdx + dealCount - 1) % 4;
             io.to(roomId).emit('corte_card_deal_animation', {
@@ -957,6 +1056,7 @@ io.on('connection', (socket: any) => {
             if (!pid) continue;
             const partnerId = g.slots[(i + 2) % 4];
             if (!partnerId) continue;
+            if (g.bots.has(pid)) continue; // bots não precisam de compartilhamento visual
             const sid = userSockets[pid];
             if (sid) {
               io.to(sid).emit('last_round_card_share', {
@@ -971,6 +1071,7 @@ io.on('connection', (socket: any) => {
             activeGames[roomId].gameState.currentTurn = savedTurn;
             io.to(roomId).emit('game_update', activeGames[roomId].gameState);
             io.to(roomId).emit('last_round_share_done');
+            scheduleBotIfNeeded(roomId);
           }, 8500);
           return;
         }
@@ -983,7 +1084,6 @@ io.on('connection', (socket: any) => {
           const handWinner: 1 | 2 = t1Pts >= t2Pts ? 1 : 2;
           const loserPts = handWinner === 1 ? t2Pts : t1Pts;
           const isCapote = loserPts <= 30;
-          // Regra 59x61: resultado apertado → ponto duplo
           const isCloseCall = !isCapote && ((t1Pts === 59 && t2Pts === 61) || (t1Pts === 61 && t2Pts === 59));
           let pts = s.isCopas ? 2 : 1;
           if (isCapote) pts = s.isCopas ? 3 : 2;
@@ -1009,12 +1109,326 @@ io.on('connection', (socket: any) => {
           }
         } else {
           io.to(roomId).emit('game_update', s);
+          scheduleBotIfNeeded(roomId);
         }
       }, sevenFundoAceCard ? 4500 : 2500);
       return;
     }
 
     io.to(roomId).emit('game_update', state);
+    scheduleBotIfNeeded(roomId);
+  };
+
+  socket.on('play_card', ({ roomId, cardId }: { roomId: string, cardId: string }) => {
+    processCardPlay(roomId, userId, cardId, (msg) => socket.emit('error', msg));
+  });
+
+  // ── Bot scheduling ────────────────────────────────────────────────────────────
+
+  const scheduleBotIfNeeded = (roomId: string) => {
+    const game = activeGames[roomId];
+    if (!game || !game.gameState) return;
+    const state = game.gameState;
+
+    if (state.status === 'CUTTING' && state.cutterId && game.bots.has(state.cutterId)) {
+      const botId = state.cutterId;
+      setTimeout(() => executeBotCut(roomId, botId), 1500);
+      return;
+    }
+
+    if (state.status === 'IN_GAME' && state.currentTurn && game.bots.has(state.currentTurn)) {
+      const botId = state.currentTurn;
+      const delay = 1200 + Math.floor(Math.random() * 800);
+      setTimeout(() => executeBotPlay(roomId, botId), delay);
+    }
+  };
+
+  const executeBotCut = (roomId: string, botId: string) => {
+    const game = activeGames[roomId];
+    if (!game || !game.gameState) return;
+    const state = game.gameState;
+    if (state.status !== 'CUTTING' || state.cutterId !== botId) return;
+    if (!game.bots.has(botId)) return;
+
+    const choice = chooseBotCorte(state.cuttingCards, game.botLevel);
+
+    // Emular select_corte handler
+    if ('isBater' in choice && choice.isBater) {
+      state.isCopas = true;
+      state.trumpSuit = 'Copas';
+      state.cuttingCards = [];
+      io.to(roomId).emit('system_message', `${game.nicknames[botId]} (BOT) BATEU EM COPAS!`);
+    } else {
+      const cardId = (choice as { cardId: string }).cardId;
+      const card = state.cuttingCards.find(c => c.id === cardId);
+      if (!card) return;
+      state.trumpSuit = card.suit;
+      const isBisca = card.value === 'A' || card.value === '7';
+      if (isBisca) {
+        state.trumpSuit = BiscaEngine.getSuitInversion(card.suit);
+        state.visibleCorte = null;
+      } else {
+        state.visibleCorte = card;
+      }
+      io.to(roomId).emit('game_update', state);
+    }
+
+    setTimeout(() => {
+      if (!activeGames[roomId] || !activeGames[roomId].gameState) return;
+      const g = activeGames[roomId];
+      const s = g.gameState;
+      const chosenCardId = 'cardId' in choice ? choice.cardId : undefined;
+
+      if (!s.isCopas) {
+        const isBiscaMode = !s.visibleCorte;
+        s.deck.push(...s.cuttingCards.filter(c => isBiscaMode || c.id !== chosenCardId));
+        s.cuttingCards = [];
+        s.deck = BiscaEngine.shuffle(s.deck);
+        if (s.visibleCorte) {
+          const idx = s.deck.findIndex(c => c.id === s.visibleCorte!.id);
+          if (idx !== -1) s.deck.splice(idx, 1);
+          s.deck.unshift(s.visibleCorte);
+        }
+      } else {
+        s.deck.push(...s.cuttingCards);
+        s.cuttingCards = [];
+        s.deck = BiscaEngine.shuffle(s.deck);
+      }
+
+      s.status = 'SHUFFLING';
+      io.to(roomId).emit('game_update', s);
+
+      setTimeout(() => {
+        if (!activeGames[roomId] || !activeGames[roomId].gameState) return;
+        const g2 = activeGames[roomId];
+        const s2 = g2.gameState;
+        s2.status = 'DEALING';
+        io.to(roomId).emit('game_update', s2);
+
+        const cutterIdx = g2.slots.indexOf(s2.cutterId!);
+        const startIdx = (cutterIdx + 1) % 4;
+
+        let dealStep = 0;
+        const dealInterval = setInterval(() => {
+          if (!activeGames[roomId] || !activeGames[roomId].gameState) { clearInterval(dealInterval); return; }
+          const currState = activeGames[roomId].gameState;
+          const targetIdx = (startIdx + dealStep) % 4;
+          const targetUserId = g2.slots[targetIdx]!;
+
+          const dealtCard = currState.deck.pop()!;
+          currState.players[targetUserId].hand.push(dealtCard);
+          currState.lastDealtUserId = targetUserId;
+          io.to(roomId).emit('game_update', currState);
+
+          dealStep++;
+          if (dealStep === 12) {
+            clearInterval(dealInterval);
+            currState.status = 'IN_GAME';
+            currState.lastDealtUserId = null;
+            currState.currentTurn = g2.slots[startIdx]!;
+            io.to(roomId).emit('game_update', currState);
+            io.to(roomId).emit('system_message', `Cartas dadas! Começa ${g2.nicknames[currState.currentTurn]}.`);
+            if (currState.visibleCorte && !currState.isCopas && !currState.corteSwapDone) {
+              const corteSuit = currState.visibleCorte.suit;
+              for (const pid of g2.slots) {
+                if (!pid) continue;
+                const twoCard = currState.players[pid].hand.find(c => c.value === '2' && c.suit === corteSuit);
+                if (twoCard) {
+                  if (g2.bots.has(pid)) {
+                    if (shouldBotSwap2(currState.players[pid].hand, currState.visibleCorte!, g2.botLevel)) {
+                      setTimeout(() => {
+                        const gr = activeGames[roomId];
+                        if (!gr || !gr.gameState || gr.gameState.corteSwapDone) return;
+                        const st = gr.gameState;
+                        const pl = st.players[pid];
+                        const tidx = pl.hand.findIndex(c => c.value === '2' && c.suit === st.visibleCorte?.suit);
+                        if (tidx !== -1 && st.visibleCorte) {
+                          const tCard = pl.hand.splice(tidx, 1)[0];
+                          const oldCorte = st.visibleCorte;
+                          pl.hand.push(oldCorte);
+                          st.visibleCorte = tCard;
+                          st.corteSwapDone = true;
+                          const dkIdx = st.deck.findIndex(c => c.id === oldCorte.id);
+                          if (dkIdx !== -1) st.deck[dkIdx] = tCard;
+                          io.to(roomId).emit('system_message', `${gr.nicknames[pid]} (BOT) trocou o 2 pela carta do corte.`);
+                          io.to(roomId).emit('game_update', st);
+                        }
+                      }, 1200);
+                    }
+                  } else {
+                    const sid = userSockets[pid];
+                    if (sid) io.to(sid).emit('trump_two_available', { corteCard: currState.visibleCorte, twoCard });
+                  }
+                  break;
+                }
+              }
+            }
+            scheduleBotIfNeeded(roomId);
+          }
+        }, 600);
+      }, 400);
+    }, 800);
+  };
+
+  const executeBotPlay = (roomId: string, botId: string) => {
+    const game = activeGames[roomId];
+    if (!game || !game.gameState) return;
+    const state = game.gameState;
+    if (state.status !== 'IN_GAME' || state.currentTurn !== botId) return;
+    if (!game.bots.has(botId)) return;
+
+    const player = state.players[botId];
+    if (!player || player.hand.length === 0) return;
+
+    // Verificar bater em copas (primeira jogada da mão)
+    if (state.roundCount === 0 && state.vaza.length === 0 && state.trumpSuit) {
+      const botTeam = game.teams[botId] as 1 | 2;
+      if (shouldBotBaterCopas(player.hand, state.trumpSuit, state.gameScore, botTeam, game.botLevel)) {
+        state.isCopas = true;
+        state.trumpSuit = 'Copas';
+        io.to(roomId).emit('system_message', `${game.nicknames[botId]} (BOT) BATEU EM COPAS! Mão vale dobrado.`);
+        io.to(roomId).emit('game_update', state);
+      }
+    }
+
+    const card = chooseBotCard(
+      player.hand, state, botId,
+      game.botLevel, game.sevenTrumpPlayed,
+      game.playedCards, game.slots, game.teams
+    );
+
+    processCardPlay(roomId, botId, card.id, (msg) => {
+      console.warn(`[BOT] Carta inválida escolhida (${botId}): ${msg}. Tentando outra...`);
+      // Failsafe: joga a primeira carta da mão
+      if (player.hand.length > 0) {
+        processCardPlay(roomId, botId, player.hand[0].id, () => {});
+      }
+    });
+  };
+
+  // ── Novos socket handlers de bot ──────────────────────────────────────────────
+
+  socket.on('add_bot', async ({ roomId }: { roomId: string }) => {
+    const game = activeGames[roomId];
+    if (!game) return;
+    if (game.ownerId !== userId) return socket.emit('error', 'Apenas o dono pode adicionar bots.');
+    if (game.gameState) return socket.emit('error', 'Não é possível adicionar bots durante o jogo.');
+
+    const emptySlot = game.slots.indexOf(null);
+    if (emptySlot === -1) return socket.emit('error', 'Sala cheia.');
+
+    try {
+      // Buscar nomes não usados na sala
+      const usedNames = new Set(Object.values(game.nicknames));
+      const { rows } = await pool.query('SELECT id, name FROM bot_names ORDER BY RANDOM() LIMIT 20');
+      const available = rows.filter(r => !usedNames.has(r.name));
+      if (available.length === 0) return socket.emit('error', 'Todos os nomes de bots já estão em uso.');
+
+      const chosen = available[0];
+      const botId = `bot-${uuidv4()}`;
+
+      game.slots[emptySlot] = botId;
+      game.nicknames[botId] = chosen.name;
+      game.teams[botId] = (emptySlot % 2 === 0) ? 1 : 2;
+      game.bots.add(botId);
+
+      io.to(roomId).emit('room_update', {
+        slots: game.slots, nicknames: game.nicknames,
+        teams: game.teams, ownerId: game.ownerId, spectators: game.spectators,
+        bots: [...game.bots]
+      });
+    } catch (e) {
+      socket.emit('error', 'Erro ao adicionar bot.');
+    }
+  });
+
+  socket.on('remove_bot', ({ roomId, botUserId }: { roomId: string; botUserId: string }) => {
+    const game = activeGames[roomId];
+    if (!game) return;
+    if (game.ownerId !== userId) return socket.emit('error', 'Apenas o dono pode remover bots.');
+    if (game.gameState) return socket.emit('error', 'Não é possível remover bots durante o jogo.');
+    if (!game.bots.has(botUserId)) return socket.emit('error', 'Bot não encontrado.');
+
+    const slotIdx = game.slots.indexOf(botUserId);
+    if (slotIdx !== -1) game.slots[slotIdx] = null;
+    game.bots.delete(botUserId);
+    delete game.nicknames[botUserId];
+    delete game.teams[botUserId];
+
+    io.to(roomId).emit('room_update', {
+      slots: game.slots, nicknames: game.nicknames,
+      teams: game.teams, ownerId: game.ownerId, spectators: game.spectators,
+      bots: [...game.bots]
+    });
+  });
+
+  socket.on('take_bot_seat', ({ roomId, botSlotIdx }: { roomId: string; botSlotIdx: number }) => {
+    const game = activeGames[roomId];
+    if (!game) return;
+    if (game.gameState) return socket.emit('error', 'Não é possível durante o jogo.');
+    if (!game.spectators.some(s => s.userId === userId)) return socket.emit('error', 'Você não está na fila de espera.');
+
+    const botId = game.slots[botSlotIdx];
+    if (!botId || !game.bots.has(botId)) return socket.emit('error', 'Slot inválido.');
+
+    // Remove bot
+    game.slots[botSlotIdx] = null;
+    game.bots.delete(botId);
+    delete game.nicknames[botId];
+    delete game.teams[botId];
+
+    // Coloca usuário no slot
+    game.slots[botSlotIdx] = userId;
+    game.teams[userId] = (botSlotIdx % 2 === 0) ? 1 : 2;
+    if (!game.nicknames[userId]) {
+      const spec = game.spectators.find(s => s.userId === userId);
+      if (spec) game.nicknames[userId] = spec.nickname;
+    }
+
+    // Remove de spectators
+    const specIdx = game.spectators.findIndex(s => s.userId === userId);
+    if (specIdx !== -1) game.spectators.splice(specIdx, 1);
+
+    io.to(roomId).emit('room_update', {
+      slots: game.slots, nicknames: game.nicknames,
+      teams: game.teams, ownerId: game.ownerId, spectators: game.spectators,
+      bots: [...game.bots]
+    });
+    io.to(roomId).emit('queue_updated', { spectators: game.spectators });
+  });
+
+  socket.on('set_bot_level', ({ roomId, level }: { roomId: string; level: BotLevel }) => {
+    const game = activeGames[roomId];
+    if (!game) return;
+    if (game.ownerId !== userId) return socket.emit('error', 'Apenas o dono pode definir o nível dos bots.');
+    if (game.gameState) return socket.emit('error', 'Não é possível alterar durante o jogo.');
+
+    game.botLevel = level;
+    io.to(roomId).emit('bot_level_update', { level });
+  });
+
+  socket.on('restart_game', async ({ roomId }: { roomId: string }) => {
+    const game = activeGames[roomId];
+    if (!game) return;
+    if (game.ownerId !== userId) return socket.emit('error', 'Apenas o dono pode reiniciar o jogo.');
+    if (!game.gameState) return socket.emit('error', 'Não há jogo em andamento.');
+    if (game.bots.size === 0) return socket.emit('error', 'Não há bots na sala.');
+    if (game.spectators.length === 0) return socket.emit('error', 'Não há espectadores na sala.');
+
+    game.gameState = null as any;
+    game.playedCards = [];
+    game.sevenTrumpPlayed = false;
+    game.lastRoundShareDone = false;
+
+    try { await pool.query('UPDATE rooms SET status = $1 WHERE id = $2', ['WAITING', roomId]); } catch {}
+
+    io.to(roomId).emit('game_reset');
+    io.to(roomId).emit('room_update', {
+      slots: game.slots, nicknames: game.nicknames,
+      teams: game.teams, ownerId: game.ownerId, spectators: game.spectators,
+      bots: [...game.bots]
+    });
+    io.to(roomId).emit('system_message', 'O dono reiniciou a partida. Sala de espera reaberta!');
   });
 
   socket.on('send_chat', ({ roomId, text }: { roomId: string, text: string }) => {
@@ -1101,6 +1515,9 @@ io.on('connection', (socket: any) => {
   });
 
   socket.on('disconnect', async () => {
+    // Bots não têm socket real — ignorar
+    if (userId.startsWith('bot-')) return;
+
     delete userSockets[userId];
     for (const roomId in activeGames) {
       const game = activeGames[roomId];

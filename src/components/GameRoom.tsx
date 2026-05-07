@@ -7,7 +7,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useApp } from '../App';
 import { motion, AnimatePresence } from 'motion/react';
 import { GameState, Card, ChatMessage } from '../lib/types';
-import { ChevronLeft, WifiOff, RefreshCcw, Send, MessageSquare, Crown, X } from 'lucide-react';
+import { ChevronLeft, WifiOff, RefreshCcw, Send, MessageSquare, Crown, X, Bot, Plus } from 'lucide-react';
 
 // Cores por dupla
 const TEAM_COLORS = {
@@ -24,7 +24,9 @@ export default function GameRoom() {
     teams: Record<string, number>;
     ownerId: string | null;
     spectators: { userId: string; nickname: string }[];
-  }>({ slots: [null, null, null, null], nicknames: {}, teams: {}, ownerId: null, spectators: [] });
+    bots: string[];
+  }>({ slots: [null, null, null, null], nicknames: {}, teams: {}, ownerId: null, spectators: [], bots: [] });
+  const [botLevel, setBotLevel] = useState<'basic' | 'medium' | 'advanced'>('basic');
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -95,7 +97,8 @@ export default function GameRoom() {
     socket.on('init_sync', (data: any) => {
       setGameState(data.gameState);
       setConfig(data.config);
-      setRoomData({ slots: data.slots, nicknames: data.nicknames, teams: data.teams, ownerId: data.ownerId, spectators: data.spectators || [] });
+      setRoomData({ slots: data.slots, nicknames: data.nicknames, teams: data.teams, ownerId: data.ownerId, spectators: data.spectators || [], bots: data.bots || [] });
+      if (data.botLevel) setBotLevel(data.botLevel);
       if (data.chat) setMessages(data.chat);
     });
 
@@ -112,7 +115,8 @@ export default function GameRoom() {
       if (data.toUserId === user?.id) setSwapReq({ from: data.from, fromNickname: data.fromNickname });
     });
 
-    socket.on('room_update', (data: any) => setRoomData(prev => ({ ...prev, ...data })));
+    socket.on('room_update', (data: any) => setRoomData(prev => ({ ...prev, ...data, bots: data.bots || prev.bots })));
+    socket.on('bot_level_update', ({ level }: { level: 'basic' | 'medium' | 'advanced' }) => setBotLevel(level));
     socket.on('game_started', (state: GameState) => { setGameState(state); setSysMsg('A partida começou!'); });
     socket.on('game_update', (state: GameState) => {
       setGameState(state);
@@ -256,7 +260,8 @@ export default function GameRoom() {
        'player_disconnected','player_reconnected','trump_ace_reveal',
        'trump_two_available','trump_seven_fundo_ace_reveal','trump_seven_reveal',
        'post_vaza_deal_sequence','corte_card_deal_animation',
-       'last_round_card_share','last_round_share_done'
+       'last_round_card_share','last_round_share_done',
+       'bot_level_update'
       ].forEach(ev => socket.off(ev));
     };
   }, [socket, currentRoomId, user?.id]);
@@ -320,6 +325,14 @@ export default function GameRoom() {
   const castKickVote = (approve: boolean) => socket?.emit('cast_kick_vote', { roomId: currentRoomId, approve });
   const handleSpectatorPick = (removeUserId: string) => { socket?.emit('spectator_remove_player', { roomId: currentRoomId, removeUserId }); setSpectatorChoose(null); };
   const leaveRoom = () => { socket?.emit('leave_room', currentRoomId); setView('LOBBY'); };
+  const addBot = () => socket?.emit('add_bot', { roomId: currentRoomId });
+  const removeBot = (botUserId: string) => socket?.emit('remove_bot', { roomId: currentRoomId, botUserId });
+  const takeBotSeat = (botSlotIdx: number) => socket?.emit('take_bot_seat', { roomId: currentRoomId, botSlotIdx });
+  const setBotLevelAction = (level: 'basic' | 'medium' | 'advanced') => socket?.emit('set_bot_level', { roomId: currentRoomId, level });
+  const restartGame = () => {
+    if (!confirm('Reiniciar a partida? O placar da mão atual será perdido, mas os bots permanecerão.')) return;
+    socket?.emit('restart_game', { roomId: currentRoomId });
+  };
 
   const isSpectator = roomData.spectators.some(s => s.userId === user?.id);
   const myIdx = roomData.slots.indexOf(user?.id || null);
@@ -500,6 +513,8 @@ export default function GameRoom() {
             {roomData.slots.map((uid, idx) => {
               const relPos = getRelPos(idx);
               const team = roomData.teams[uid || ''] as 1 | 2 | undefined;
+              const isBot = uid ? roomData.bots.includes(uid) : false;
+              const isOwnerUser = user?.id === roomData.ownerId;
               return (
                 <PlayerSlot
                   key={idx}
@@ -508,16 +523,21 @@ export default function GameRoom() {
                   nickname={roomData.nicknames[uid || ''] || '...'}
                   isMe={uid === user?.id}
                   team={team}
+                  isBot={isBot}
                   vazaCard={gameState?.vaza.find(v => v.userId === uid)?.card}
                   onSwap={() => requestSwap(idx)}
-                  showSwap={gameState === null && uid !== user?.id}
+                  showSwap={gameState === null && uid !== user?.id && !isBot}
                   isOwner={uid === roomData.ownerId}
                   handSize={gameState?.players[uid || '']?.hand.length || 0}
                   visibleHand={isSpectator && config?.spectatorsSeeHands ? (gameState?.players[uid || '']?.hand || []) : undefined}
                   isRoundStarter={gameState?.status === 'IN_GAME' && gameState.vaza[0]?.userId === uid}
                   isLeadingTeam={leadingTeam !== null && team === leadingTeam}
-                  canKick={!isSpectator && uid !== null && uid !== user?.id && !kickVote && !!gameState}
+                  canKick={!isSpectator && uid !== null && uid !== user?.id && !kickVote && !!gameState && !isBot}
                   onKick={() => uid && initiateKick(uid)}
+                  showRemoveBot={isOwnerUser && isBot && !gameState}
+                  onRemoveBot={() => uid && removeBot(uid)}
+                  showTakeSeat={isSpectator && isBot && !isOwnerUser && !gameState}
+                  onTakeSeat={() => takeBotSeat(idx)}
                 />
               );
             })}
@@ -764,20 +784,47 @@ export default function GameRoom() {
                 </div>
               ) : (
                 /* Sala de espera (sem jogo) */
-                <div className="text-center pointer-events-auto bg-black/20 p-6 md:p-12 rounded-full border border-white/5 backdrop-blur-sm">
-                  <h3 className="text-white font-black uppercase tracking-widest text-[10px] md:text-sm mb-3">Sala de Espera</h3>
-                  <div className="flex gap-2 justify-center mb-6">
+                <div className="text-center pointer-events-auto bg-black/20 p-4 md:p-8 rounded-3xl border border-white/5 backdrop-blur-sm flex flex-col items-center gap-3">
+                  <h3 className="text-white font-black uppercase tracking-widest text-[10px] md:text-sm">Sala de Espera</h3>
+                  <div className="flex gap-2 justify-center">
                     {roomData.slots.map((s, i) => {
                       const team = roomData.teams[s || ''] as 1 | 2 | undefined;
                       const tc = team ? TEAM_COLORS[team] : null;
+                      const isBot = s ? roomData.bots.includes(s) : false;
+                      const isOwner = user?.id === roomData.ownerId;
                       return (
                         <div key={i} className="relative flex flex-col items-center gap-1">
-                          <div className={`w-3 h-3 rounded-full ${s ? (tc?.dot || 'bg-blue-500') : 'bg-slate-800'} ${s ? 'shadow-[0_0_8px_rgba(59,130,246,0.5)]' : ''}`} />
+                          {s === null && isOwner ? (
+                            <button onClick={addBot}
+                              className="w-5 h-5 rounded-full bg-amber-900/50 hover:bg-amber-700 border border-amber-500/40 flex items-center justify-center transition text-amber-400 hover:text-white"
+                              title="Adicionar Bot">
+                              <Plus size={9} />
+                            </button>
+                          ) : isBot ? (
+                            <div className="w-3 h-3 rounded-full bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.6)] flex items-center justify-center text-[5px]">🤖</div>
+                          ) : (
+                            <div className={`w-3 h-3 rounded-full ${s ? (tc?.dot || 'bg-blue-500') : 'bg-slate-800'} ${s ? 'shadow-[0_0_8px_rgba(59,130,246,0.5)]' : ''}`} />
+                          )}
                           {s === roomData.ownerId && <Crown size={8} fill="currentColor" className="text-yellow-500" />}
                         </div>
                       );
                     })}
                   </div>
+
+                  {/* Nível dos bots (dono) */}
+                  {user?.id === roomData.ownerId && roomData.bots.length > 0 && (
+                    <div className="flex items-center gap-1.5 bg-slate-900/60 rounded-xl px-3 py-1.5 border border-amber-500/20">
+                      <Bot size={10} className="text-amber-400" />
+                      <span className="text-[8px] text-amber-400 font-black uppercase">Nível:</span>
+                      {(['basic', 'medium', 'advanced'] as const).map(lvl => (
+                        <button key={lvl} onClick={() => setBotLevelAction(lvl)}
+                          className={`text-[7px] font-black uppercase px-2 py-0.5 rounded-lg transition ${botLevel === lvl ? 'bg-amber-600 text-white' : 'bg-slate-800 text-slate-500 hover:text-amber-400'}`}>
+                          {lvl === 'basic' ? 'Básico' : lvl === 'medium' ? 'Médio' : 'Avançado'}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
                   {user?.id === roomData.ownerId && !gameState && (
                     <button onClick={startGame}
                       disabled={roomData.slots.filter(s=>s!==null).length !== 4}
@@ -843,6 +890,17 @@ export default function GameRoom() {
             )}
           </AnimatePresence>
         </div>
+
+        {/* Botão de reiniciar jogo (owner, mid-game, há bots e espectadores) */}
+        {user?.id === roomData.ownerId && !!gameState && roomData.bots.length > 0 && roomData.spectators.length > 0 && (
+          <div className="absolute bottom-[140px] md:bottom-[172px] right-3 z-[50]">
+            <button onClick={restartGame}
+              className="flex items-center gap-1.5 bg-slate-800/90 hover:bg-red-900/80 border border-red-500/30 hover:border-red-400/60 text-red-400 hover:text-white px-3 py-1.5 rounded-xl text-[8px] font-black uppercase transition active:scale-95 shadow-lg backdrop-blur-sm">
+              <RefreshCcw size={10} />
+              Reiniciar
+            </button>
+          </div>
+        )}
 
         {/* Rodapé — Mão do jogador */}
         <div className="h-36 md:h-44 flex items-center justify-center p-3 md:p-6 bg-slate-900/50 border-t border-slate-800 relative z-10 shrink-0">
@@ -1268,7 +1326,7 @@ function CountUp({ target, className }: { target: number; className?: string }) 
 }
 
 // ── Slot de Jogador na Mesa ──
-function PlayerSlot({ relPos, isTurn, nickname, isMe, team, vazaCard, onSwap, showSwap, isOwner, handSize, isRoundStarter, isLeadingTeam, visibleHand, canKick, onKick }: any) {
+function PlayerSlot({ relPos, isTurn, nickname, isMe, team, isBot, vazaCard, onSwap, showSwap, isOwner, handSize, isRoundStarter, isLeadingTeam, visibleHand, canKick, onKick, showRemoveBot, onRemoveBot, showTakeSeat, onTakeSeat }: any) {
   const posClasses: any = {
     0: 'bottom-[-20px] md:bottom-[-40px] left-1/2 -translate-x-1/2',
     1: 'right-[-20px] md:right-[-40px] top-1/2 -translate-y-1/2',
@@ -1326,15 +1384,18 @@ function PlayerSlot({ relPos, isTurn, nickname, isMe, team, vazaCard, onSwap, sh
         {isOwner && <div className="absolute -top-5 text-yellow-500"><Crown size={12} fill="currentColor" /></div>}
 
         {/* Avatar */}
-        <div className={`relative w-8 h-8 md:w-11 md:h-11 rounded-full bg-slate-800 border-2 md:border-[3px] flex items-center justify-center text-[8px] md:text-[10px] font-bold shadow-lg transition-all duration-300 ${isTurn ? 'border-yellow-400 shadow-[0_0_14px_rgba(250,204,21,0.7)] scale-110' : teamRing}`}>
-          {nickname[0]?.toUpperCase()}
+        <div className={`relative w-8 h-8 md:w-11 md:h-11 rounded-full border-2 md:border-[3px] flex items-center justify-center text-[8px] md:text-[10px] font-bold shadow-lg transition-all duration-300
+          ${isBot ? 'bg-amber-950/80' : 'bg-slate-800'}
+          ${isTurn ? 'border-yellow-400 shadow-[0_0_14px_rgba(250,204,21,0.7)] scale-110' : isBot ? 'border-amber-500/70' : teamRing}`}>
+          {isBot ? <span className="text-sm">🤖</span> : nickname[0]?.toUpperCase()}
           {isRoundStarter && <div className="absolute -bottom-1 left-1/2 -translate-x-1/2 w-2 h-2 bg-white rounded-full border border-slate-600 shadow" />}
         </div>
 
         {/* Nome + badge de dupla */}
-        <div className={`flex flex-col items-center px-2 py-0.5 rounded-full border shadow-lg backdrop-blur ${isTurn ? 'bg-yellow-900/30 border-yellow-400/60' : 'bg-slate-900/90 border-slate-700'}`}>
-          <span className={`font-bold text-[7px] md:text-[8px] truncate max-w-[60px] uppercase ${isTurn ? 'text-yellow-200' : 'text-white'}`}>{nickname}</span>
-          {tc && <span className={`text-[5px] font-black uppercase tracking-widest ${tc.text}`}>{tc.label}</span>}
+        <div className={`flex flex-col items-center px-2 py-0.5 rounded-full border shadow-lg backdrop-blur ${isTurn ? 'bg-yellow-900/30 border-yellow-400/60' : isBot ? 'bg-amber-950/60 border-amber-500/30' : 'bg-slate-900/90 border-slate-700'}`}>
+          <span className={`font-bold text-[7px] md:text-[8px] truncate max-w-[60px] uppercase ${isTurn ? 'text-yellow-200' : isBot ? 'text-amber-300' : 'text-white'}`}>{nickname}</span>
+          {isBot && <span className="text-[5px] font-black uppercase tracking-widest text-amber-500">BOT</span>}
+          {!isBot && tc && <span className={`text-[5px] font-black uppercase tracking-widest ${tc.text}`}>{tc.label}</span>}
         </div>
 
         {/* Botão de kick (X abaixo do nome) */}
@@ -1344,6 +1405,26 @@ function PlayerSlot({ relPos, isTurn, nickname, isMe, team, vazaCard, onSwap, sh
             title="Votar para remover">
             <X size={8} />
           </button>
+        )}
+
+        {/* Botão de remover bot (dono, pré-jogo) */}
+        {showRemoveBot && (
+          <button onClick={(e) => { e.stopPropagation(); onRemoveBot?.(); }}
+            className="mt-0.5 pointer-events-auto w-4 h-4 md:w-5 md:h-5 rounded-full bg-red-900/40 hover:bg-red-600 border border-red-500/40 hover:border-red-400 flex items-center justify-center transition text-red-400 hover:text-white"
+            title="Remover bot">
+            <X size={8} />
+          </button>
+        )}
+
+        {/* Botão tomar assento do bot (espectador não-dono, pré-jogo) */}
+        {showTakeSeat && (
+          <motion.button
+            onClick={(e: React.MouseEvent) => { e.stopPropagation(); onTakeSeat?.(); }}
+            animate={{ boxShadow: ['0 0 0px rgba(245,158,11,0)', '0 0 12px rgba(245,158,11,0.8)', '0 0 0px rgba(245,158,11,0)'] }}
+            transition={{ repeat: Infinity, duration: 1.5 }}
+            className="mt-0.5 pointer-events-auto text-[6px] font-black px-1.5 py-0.5 rounded-lg bg-amber-600/20 hover:bg-amber-600 text-amber-400 hover:text-white border border-amber-500/40 transition whitespace-nowrap">
+            ENTRAR
+          </motion.button>
         )}
 
         {/* Botão de troca (sala de espera) */}
