@@ -81,6 +81,8 @@ export default function GameRoom() {
     partnerNickname: string;
     phase: 'sending' | 'viewing' | 'returning';
   } | null>(null);
+  // Trava anti-double-play (client-side)
+  const [isPlayingCard, setIsPlayingCard] = useState(false);
 
   // Ref para roomData dentro de callbacks de socket (evita stale closure)
   const roomDataRef = useRef(roomData);
@@ -120,6 +122,7 @@ export default function GameRoom() {
     socket.on('game_started', (state: GameState) => { setGameState(state); setSysMsg('A partida começou!'); });
     socket.on('game_update', (state: GameState) => {
       setGameState(state);
+      if (state.currentTurn !== user?.id) setIsPlayingCard(false);
       if (state.corteSwapDone || state.roundCount > 0) {
         setTrumpTwoPrompt(null);
         setSwapPhase(null);
@@ -250,6 +253,7 @@ export default function GameRoom() {
       setSevenReveal(null);
       setSevenFundoReveal(null);
       setAceReveal(null);
+      setIsPlayingCard(false);
     });
 
     return () => {
@@ -309,7 +313,12 @@ export default function GameRoom() {
   const requestSwap = (toIdx: number) => socket?.emit('request_swap', { roomId: currentRoomId, toIdx });
   const acceptSwap = () => { if (swapReq) { socket?.emit('accept_swap', { roomId: currentRoomId, fromUserId: swapReq.from }); setSwapReq(null); } };
   const startGame = () => socket?.emit('start_game', currentRoomId);
-  const playCard = (cardId: string) => { if (gameState?.currentTurn !== user?.id) return; socket?.emit('play_card', { roomId: currentRoomId, cardId }); };
+  const playCard = (cardId: string) => {
+    if (gameState?.currentTurn !== user?.id) return;
+    if (isPlayingCard) return;
+    setIsPlayingCard(true);
+    socket?.emit('play_card', { roomId: currentRoomId, cardId });
+  };
   const swap2Corte = () => socket?.emit('swap_corte_2', currentRoomId);
   const performTwoSwap = () => {
     setSwapPhase('animating');
@@ -1005,7 +1014,7 @@ export default function GameRoom() {
         {/* Última rodada — troca de cartas entre parceiros */}
         <AnimatePresence>
           {lastRoundShare && (
-            <div className="fixed inset-0 bg-slate-950/90 backdrop-blur-md flex flex-col items-center justify-center z-[275] p-4">
+            <div className="absolute inset-0 bg-slate-950/90 backdrop-blur-md flex flex-col items-center justify-center z-[275] p-4">
               <motion.div initial={{ scale: 0.85, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }}
                 className="bg-slate-800 border-2 border-blue-500/60 p-6 rounded-[2rem] shadow-2xl max-w-sm w-full text-center">
 
@@ -1177,9 +1186,19 @@ export default function GameRoom() {
                 transition={{ type:'spring', damping:20, stiffness:250 }}
                 className="bg-slate-800 border-2 border-slate-600 p-8 rounded-[2.5rem] shadow-2xl max-w-sm w-full text-center">
                 <div className="text-3xl mb-3">{handResult.isCapote ? '💥' : handResult.isCloseCall ? '⚠️' : '🃏'}</div>
-                <h3 className="text-xl font-black text-white uppercase mb-1">
+                <h3 className="text-xl font-black text-white uppercase mb-2">
                   {handResult.isCapote ? 'CAPOTE!' : 'Fim da Mão!'}
                 </h3>
+                {/* VITÓRIA / DERROTA — só para jogadores (não espectadores) */}
+                {roomData.teams[user?.id || ''] && (() => {
+                  const myTeam = roomData.teams[user?.id || ''];
+                  const isVictory = myTeam === handResult.winnerTeam;
+                  return (
+                    <div className={`inline-flex items-center gap-2 px-5 py-1.5 rounded-full font-black text-sm uppercase tracking-widest mb-3 border ${isVictory ? 'bg-green-700/25 border-green-500/60 text-green-300' : 'bg-red-900/25 border-red-500/60 text-red-400'}`}>
+                      {isVictory ? '🏆 VITÓRIA' : '💔 DERROTA'}
+                    </div>
+                  );
+                })()}
                 {handResult.isCopas && <p className="text-red-400 text-xs font-black uppercase mb-3">♥ Mão de Copas</p>}
                 {handResult.isCloseCall && (
                   <div className="flex items-center justify-center gap-2 bg-amber-900/40 border border-amber-500/60 rounded-xl px-4 py-2 mb-3">

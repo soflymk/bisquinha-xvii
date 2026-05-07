@@ -916,6 +916,9 @@ io.on('connection', (socket: any) => {
 
     if (state.currentTurn !== playerId) return;
 
+    // Guard: impede double-play caso o player já tenha jogado nesta vaza
+    if (state.vaza.some(v => v.userId === playerId)) return;
+
     const player = state.players[playerId];
     const cardIdx = player.hand.findIndex(c => c.id === cardId);
     if (cardIdx === -1) return;
@@ -1051,28 +1054,34 @@ io.on('connection', (socket: any) => {
           s.currentTurn = 'SHARING';
           io.to(roomId).emit('game_update', s);
 
-          for (let i = 0; i < 4; i++) {
-            const pid = g.slots[i];
-            if (!pid) continue;
-            const partnerId = g.slots[(i + 2) % 4];
-            if (!partnerId) continue;
-            if (g.bots.has(pid)) continue; // bots não precisam de compartilhamento visual
-            const sid = userSockets[pid];
-            if (sid) {
-              io.to(sid).emit('last_round_card_share', {
-                partnerCards: s.players[partnerId].hand,
-                partnerId, partnerNickname: g.nicknames[partnerId]
-              });
+          // Aguarda animações de distribuição + ênfase da carta do corte (3500ms)
+          // antes de mostrar as cartas do parceiro
+          setTimeout(() => {
+            if (!activeGames[roomId] || !activeGames[roomId].gameState) return;
+            for (let i = 0; i < 4; i++) {
+              const pid = g.slots[i];
+              if (!pid) continue;
+              const partnerId = g.slots[(i + 2) % 4];
+              if (!partnerId) continue;
+              if (g.bots.has(pid)) continue; // bots não precisam de compartilhamento visual
+              const sid = userSockets[pid];
+              if (sid) {
+                io.to(sid).emit('last_round_card_share', {
+                  partnerCards: s.players[partnerId].hand,
+                  partnerId, partnerNickname: g.nicknames[partnerId]
+                });
+              }
             }
-          }
+          }, 3500);
 
+          // Desbloqueia após animação de compartilhamento completa (3500ms delay + 8500ms animação)
           setTimeout(() => {
             if (!activeGames[roomId] || !activeGames[roomId].gameState) return;
             activeGames[roomId].gameState.currentTurn = savedTurn;
             io.to(roomId).emit('game_update', activeGames[roomId].gameState);
             io.to(roomId).emit('last_round_share_done');
             scheduleBotIfNeeded(roomId);
-          }, 8500);
+          }, 3500 + 8500);
           return;
         }
 
