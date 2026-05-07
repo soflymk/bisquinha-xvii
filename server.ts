@@ -821,9 +821,12 @@ io.on('connection', (socket: any) => {
     const card = player.hand[cardIdx];
 
     // --- REGRA: Ás do corte antes do 7 do corte ---
-    if (card.suit === state.trumpSuit && card.value === 'A' && !game.sevenTrumpPlayed && state.deck.length > 0) {
+    // Bloqueado se o jogador tem 2+ cartas (não é a última rodada) e o 7 ainda não saiu.
+    // Exceção 1: jogador tem AMBOS (Ás + 7) — pode jogar o Ás e o 7 é revelado a todos.
+    // Exceção 2: jogador tem 1 carta (última rodada absoluta) — é obrigado a jogar o que tem.
+    if (card.suit === state.trumpSuit && card.value === 'A' && !game.sevenTrumpPlayed && player.hand.length > 1) {
       const trumpSevenEntry = player.hand.find((c, i) => i !== cardIdx && c.suit === state.trumpSuit && c.value === '7');
-      if (player.hand.length > 1 && !trumpSevenEntry) {
+      if (!trumpSevenEntry) {
         socket.emit('error', 'O Ás do corte não pode ser jogado antes do 7 do corte!');
         return;
       }
