@@ -1431,7 +1431,7 @@ function PlayerSlot({ relPos, isTurn, nickname, isMe, team, isBot, vazaCard, onS
             ${isBot ? 'bg-amber-950/80' : 'bg-slate-800'}
             ${isTurn ? 'border-yellow-400 shadow-[0_0_14px_rgba(250,204,21,0.7)] scale-110' : isBotSelected ? 'border-amber-400 shadow-[0_0_12px_rgba(251,191,36,0.8)]' : showMoveBotHere ? 'border-green-400 border-dashed' : isBot ? 'border-amber-500/70' : teamRing}
             ${(showAddBot || showMoveBotHere || isBotSelected || (onBotClick && isBot)) ? 'pointer-events-auto cursor-pointer' : ''}`}
-          onClick={(showAddBot || showMoveBotHere || isBotSelected || isBot) ? onBotClick : undefined}
+          onClick={showAddBot ? onAddBot : (showMoveBotHere || isBotSelected || isBot) ? onBotClick : undefined}
         >
           {isBot ? <span className="text-sm">🤖</span> : showMoveBotHere ? <span className="text-green-400 text-xs font-black">↓</span> : nickname[0]?.toUpperCase()}
           {isRoundStarter && <div className="absolute -bottom-1 left-1/2 -translate-x-1/2 w-2 h-2 bg-white rounded-full border border-slate-600 shadow" />}
