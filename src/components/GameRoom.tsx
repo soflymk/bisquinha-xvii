@@ -83,6 +83,8 @@ export default function GameRoom() {
   } | null>(null);
   // Trava anti-double-play (client-side)
   const [isPlayingCard, setIsPlayingCard] = useState(false);
+  // Índice do slot de bot selecionado para mover (null = nenhum)
+  const [botMoveSource, setBotMoveSource] = useState<number | null>(null);
 
   // Ref para roomData dentro de callbacks de socket (evita stale closure)
   const roomDataRef = useRef(roomData);
@@ -117,7 +119,7 @@ export default function GameRoom() {
       if (data.toUserId === user?.id) setSwapReq({ from: data.from, fromNickname: data.fromNickname });
     });
 
-    socket.on('room_update', (data: any) => setRoomData(prev => ({ ...prev, ...data, bots: data.bots || prev.bots })));
+    socket.on('room_update', (data: any) => { setRoomData(prev => ({ ...prev, ...data, bots: data.bots || prev.bots })); setBotMoveSource(null); });
     socket.on('bot_level_update', ({ level }: { level: 'basic' | 'medium' | 'advanced' }) => setBotLevel(level));
     socket.on('game_started', (state: GameState) => { setGameState(state); setSysMsg('A partida começou!'); });
     socket.on('game_update', (state: GameState) => {
@@ -135,8 +137,11 @@ export default function GameRoom() {
       const rd = roomDataRef.current;
       const winnerTeam = rd.teams[winnerId];
       const myTeam = rd.teams[user?.id || ''];
-      if (winnerTeam === myTeam) setMyTeamCardCount(prev => prev + 4);
-      else setOpponentCardCount(prev => prev + 4);
+      // Delay para deixar a animação de saída das cartas da mesa terminar antes do bolo aparecer
+      setTimeout(() => {
+        if (winnerTeam === myTeam) setMyTeamCardCount(prev => prev + 4);
+        else setOpponentCardCount(prev => prev + 4);
+      }, 900);
     });
 
     socket.on('queue_updated', ({ spectators }: any) => setRoomData(prev => ({ ...prev, spectators })));
@@ -257,6 +262,7 @@ export default function GameRoom() {
       setSevenFundoReveal(null);
       setAceReveal(null);
       setIsPlayingCard(false);
+      setBotMoveSource(null);
     });
 
     return () => {
@@ -337,7 +343,8 @@ export default function GameRoom() {
   const castKickVote = (approve: boolean) => socket?.emit('cast_kick_vote', { roomId: currentRoomId, approve });
   const handleSpectatorPick = (removeUserId: string) => { socket?.emit('spectator_remove_player', { roomId: currentRoomId, removeUserId }); setSpectatorChoose(null); };
   const leaveRoom = () => { socket?.emit('leave_room', currentRoomId); setView('LOBBY'); };
-  const addBot = () => socket?.emit('add_bot', { roomId: currentRoomId });
+  const addBot = (slotIdx?: number) => socket?.emit('add_bot', { roomId: currentRoomId, slotIdx });
+  const moveBot = (fromIdx: number, toIdx: number) => socket?.emit('move_bot', { roomId: currentRoomId, fromIdx, toIdx });
   const removeBot = (botUserId: string) => socket?.emit('remove_bot', { roomId: currentRoomId, botUserId });
   const takeBotSeat = (botSlotIdx: number) => socket?.emit('take_bot_seat', { roomId: currentRoomId, botSlotIdx });
   const setBotLevelAction = (level: 'basic' | 'medium' | 'advanced') => socket?.emit('set_bot_level', { roomId: currentRoomId, level });
@@ -546,10 +553,20 @@ export default function GameRoom() {
                   isLeadingTeam={leadingTeam !== null && team === leadingTeam}
                   canKick={!isSpectator && uid !== null && uid !== user?.id && !kickVote && !!gameState && !isBot}
                   onKick={() => uid && initiateKick(uid)}
-                  showRemoveBot={isOwnerUser && isBot && !gameState}
+                  showRemoveBot={isOwnerUser && isBot && !gameState && botMoveSource === null}
                   onRemoveBot={() => uid && removeBot(uid)}
                   showTakeSeat={isSpectator && isBot && !isOwnerUser && !gameState}
                   onTakeSeat={() => takeBotSeat(idx)}
+                  showAddBot={isOwnerUser && uid === null && !gameState && botMoveSource === null}
+                  onAddBot={() => addBot(idx)}
+                  isBotSelected={isOwnerUser && !gameState && botMoveSource === idx}
+                  showMoveBotHere={isOwnerUser && !gameState && botMoveSource !== null && botMoveSource !== idx && (uid === null || isBot)}
+                  onBotClick={() => {
+                    if (!isOwnerUser || !!gameState) return;
+                    if (botMoveSource === idx) { setBotMoveSource(null); return; }
+                    if (botMoveSource !== null && (uid === null || isBot)) { moveBot(botMoveSource, idx); setBotMoveSource(null); return; }
+                    if (isBot) setBotMoveSource(idx);
+                  }}
                 />
               );
             })}
@@ -806,13 +823,7 @@ export default function GameRoom() {
                       const isOwner = user?.id === roomData.ownerId;
                       return (
                         <div key={i} className="relative flex flex-col items-center gap-1">
-                          {s === null && isOwner ? (
-                            <button onClick={addBot}
-                              className="w-5 h-5 rounded-full bg-amber-900/50 hover:bg-amber-700 border border-amber-500/40 flex items-center justify-center transition text-amber-400 hover:text-white"
-                              title="Adicionar Bot">
-                              <Plus size={9} />
-                            </button>
-                          ) : isBot ? (
+                          {isBot ? (
                             <div className="w-3 h-3 rounded-full bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.6)] flex items-center justify-center text-[5px]">🤖</div>
                           ) : (
                             <div className={`w-3 h-3 rounded-full ${s ? (tc?.dot || 'bg-blue-500') : 'bg-slate-800'} ${s ? 'shadow-[0_0_8px_rgba(59,130,246,0.5)]' : ''}`} />
@@ -1357,7 +1368,7 @@ function CountUp({ target, className }: { target: number; className?: string }) 
 }
 
 // ── Slot de Jogador na Mesa ──
-function PlayerSlot({ relPos, isTurn, nickname, isMe, team, isBot, vazaCard, onSwap, showSwap, isOwner, handSize, isRoundStarter, isLeadingTeam, visibleHand, canKick, onKick, showRemoveBot, onRemoveBot, showTakeSeat, onTakeSeat }: any) {
+function PlayerSlot({ relPos, isTurn, nickname, isMe, team, isBot, vazaCard, onSwap, showSwap, isOwner, handSize, isRoundStarter, isLeadingTeam, visibleHand, canKick, onKick, showRemoveBot, onRemoveBot, showTakeSeat, onTakeSeat, showAddBot, onAddBot, isBotSelected, showMoveBotHere, onBotClick }: any) {
   const posClasses: any = {
     0: 'bottom-[-20px] md:bottom-[-40px] left-1/2 -translate-x-1/2',
     1: 'right-[-20px] md:right-[-40px] top-1/2 -translate-y-1/2',
@@ -1415,12 +1426,40 @@ function PlayerSlot({ relPos, isTurn, nickname, isMe, team, isBot, vazaCard, onS
         {isOwner && <div className="absolute -top-5 text-yellow-500"><Crown size={12} fill="currentColor" /></div>}
 
         {/* Avatar */}
-        <div className={`relative w-8 h-8 md:w-11 md:h-11 rounded-full border-2 md:border-[3px] flex items-center justify-center text-[8px] md:text-[10px] font-bold shadow-lg transition-all duration-300
-          ${isBot ? 'bg-amber-950/80' : 'bg-slate-800'}
-          ${isTurn ? 'border-yellow-400 shadow-[0_0_14px_rgba(250,204,21,0.7)] scale-110' : isBot ? 'border-amber-500/70' : teamRing}`}>
-          {isBot ? <span className="text-sm">🤖</span> : nickname[0]?.toUpperCase()}
+        <div
+          className={`relative w-8 h-8 md:w-11 md:h-11 rounded-full border-2 md:border-[3px] flex items-center justify-center text-[8px] md:text-[10px] font-bold shadow-lg transition-all duration-300 group
+            ${isBot ? 'bg-amber-950/80' : 'bg-slate-800'}
+            ${isTurn ? 'border-yellow-400 shadow-[0_0_14px_rgba(250,204,21,0.7)] scale-110' : isBotSelected ? 'border-amber-400 shadow-[0_0_12px_rgba(251,191,36,0.8)]' : showMoveBotHere ? 'border-green-400 border-dashed' : isBot ? 'border-amber-500/70' : teamRing}
+            ${(showAddBot || showMoveBotHere || isBotSelected || (onBotClick && isBot)) ? 'pointer-events-auto cursor-pointer' : ''}`}
+          onClick={(showAddBot || showMoveBotHere || isBotSelected || isBot) ? onBotClick : undefined}
+        >
+          {isBot ? <span className="text-sm">🤖</span> : showMoveBotHere ? <span className="text-green-400 text-xs font-black">↓</span> : nickname[0]?.toUpperCase()}
           {isRoundStarter && <div className="absolute -bottom-1 left-1/2 -translate-x-1/2 w-2 h-2 bg-white rounded-full border border-slate-600 shadow" />}
+          {/* Hover overlay — add bot */}
+          {showAddBot && (
+            <div className="absolute inset-0 rounded-full bg-amber-900/80 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity duration-150 pointer-events-none">
+              <span className="text-amber-300 font-black text-base leading-none">+</span>
+            </div>
+          )}
+          {/* Pulse ring — bot selected for move */}
+          {isBotSelected && (
+            <div className="absolute -inset-1.5 rounded-full border-2 border-amber-400 animate-pulse pointer-events-none" />
+          )}
         </div>
+        {/* Label de hover: Adicionar Bot */}
+        {showAddBot && (
+          <div className="pointer-events-auto cursor-pointer" onClick={onAddBot}>
+            <span className="text-[6px] font-black text-amber-500 uppercase tracking-widest whitespace-nowrap opacity-60 hover:opacity-100 transition-opacity">
+              + BOT
+            </span>
+          </div>
+        )}
+        {/* Label: Mover bot aqui */}
+        {showMoveBotHere && (
+          <div className="text-[6px] font-black text-green-400 uppercase tracking-widest whitespace-nowrap animate-pulse pointer-events-none">
+            MOVER AQUI
+          </div>
+        )}
 
         {/* Nome + badge de dupla */}
         <div className={`flex flex-col items-center px-2 py-0.5 rounded-full border shadow-lg backdrop-blur ${isTurn ? 'bg-yellow-900/30 border-yellow-400/60' : isBot ? 'bg-amber-950/60 border-amber-500/30' : 'bg-slate-900/90 border-slate-700'}`}>

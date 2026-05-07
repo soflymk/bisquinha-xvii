@@ -1323,14 +1323,14 @@ io.on('connection', (socket: any) => {
 
   // ── Novos socket handlers de bot ──────────────────────────────────────────────
 
-  socket.on('add_bot', async ({ roomId }: { roomId: string }) => {
+  socket.on('add_bot', async ({ roomId, slotIdx }: { roomId: string; slotIdx?: number }) => {
     const game = activeGames[roomId];
     if (!game) return;
     if (game.ownerId !== userId) return socket.emit('error', 'Apenas o dono pode adicionar bots.');
     if (game.gameState) return socket.emit('error', 'Não é possível adicionar bots durante o jogo.');
 
-    const emptySlot = game.slots.indexOf(null);
-    if (emptySlot === -1) return socket.emit('error', 'Sala cheia.');
+    const emptySlot = slotIdx !== undefined ? slotIdx : game.slots.indexOf(null);
+    if (emptySlot === -1 || game.slots[emptySlot] !== null) return socket.emit('error', 'Slot inválido ou ocupado.');
 
     try {
       // Buscar nomes não usados na sala
@@ -1369,6 +1369,31 @@ io.on('connection', (socket: any) => {
     game.bots.delete(botUserId);
     delete game.nicknames[botUserId];
     delete game.teams[botUserId];
+
+    io.to(roomId).emit('room_update', {
+      slots: game.slots, nicknames: game.nicknames,
+      teams: game.teams, ownerId: game.ownerId, spectators: game.spectators,
+      bots: [...game.bots]
+    });
+  });
+
+  socket.on('move_bot', ({ roomId, fromIdx, toIdx }: { roomId: string; fromIdx: number; toIdx: number }) => {
+    const game = activeGames[roomId];
+    if (!game) return;
+    if (game.ownerId !== userId) return;
+    if (game.gameState) return socket.emit('error', 'Não é possível mover bots durante o jogo.');
+
+    const fromId = game.slots[fromIdx];
+    const toId = game.slots[toIdx];
+    if (!fromId || !game.bots.has(fromId)) return; // fromIdx deve ser um bot
+
+    // Troca os slots
+    game.slots[fromIdx] = toId;
+    game.slots[toIdx] = fromId;
+
+    // Atualiza times conforme posição
+    game.teams[fromId] = (toIdx % 2 === 0) ? 1 : 2;
+    if (toId) game.teams[toId] = (fromIdx % 2 === 0) ? 1 : 2;
 
     io.to(roomId).emit('room_update', {
       slots: game.slots, nicknames: game.nicknames,
