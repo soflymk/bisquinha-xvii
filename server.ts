@@ -526,8 +526,12 @@ io.on('connection', (socket: any) => {
       if (!activeGames[roomId] || !activeGames[roomId].gameState) return;
       const g = activeGames[roomId];
 
-      g.lastCutterIdx = (g.lastCutterIdx + 1) % 4;
-      if (g.lastCutterIdx === -1) g.lastCutterIdx = 3;
+      // Primeiro corte da partida é sorteado; os seguintes rodam para a esquerda
+      if (g.lastCutterIdx === -1) {
+        g.lastCutterIdx = Math.floor(Math.random() * 4);
+      } else {
+        g.lastCutterIdx = (g.lastCutterIdx + 1) % 4;
+      }
 
       const cutterId = g.slots[g.lastCutterIdx]!;
       g.gameState.cutterId = cutterId;
@@ -603,7 +607,8 @@ io.on('connection', (socket: any) => {
         io.to(roomId).emit('game_update', s2);
 
         const cutterIdx = g2.slots.indexOf(s2.cutterId!);
-        const startIdx = (cutterIdx + 1) % 4;
+        // Parceiro do cortador (slots[0,2]=dupla1; slots[1,3]=dupla2; parceiro = (idx+2)%4)
+        const startIdx = (cutterIdx + 2) % 4;
 
         let dealStep = 0;
         const dealInterval = setInterval(() => {
@@ -1215,7 +1220,8 @@ io.on('connection', (socket: any) => {
         io.to(roomId).emit('game_update', s2);
 
         const cutterIdx = g2.slots.indexOf(s2.cutterId!);
-        const startIdx = (cutterIdx + 1) % 4;
+        // Parceiro do cortador joga primeiro
+        const startIdx = (cutterIdx + 2) % 4;
 
         let dealStep = 0;
         const dealInterval = setInterval(() => {

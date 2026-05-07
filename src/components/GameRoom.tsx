@@ -172,6 +172,7 @@ export default function GameRoom() {
     socket.on('game_aborted', ({ reason }: any) => { setIsAborted(true); setSysMsg(reason); });
     socket.on('error', (err: string) => {
       setGameError(err);
+      setIsPlayingCard(false); // carta rejeitada pelo servidor — libera a trava
       setTimeout(() => setGameError(null), 3000);
     });
 
