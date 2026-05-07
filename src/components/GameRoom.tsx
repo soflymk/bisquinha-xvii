@@ -122,7 +122,9 @@ export default function GameRoom() {
     socket.on('game_started', (state: GameState) => { setGameState(state); setSysMsg('A partida começou!'); });
     socket.on('game_update', (state: GameState) => {
       setGameState(state);
-      if (state.currentTurn !== user?.id) setIsPlayingCard(false);
+      // Reset trava quando a vaza foi recolhida (nova rodada) ou fora do IN_GAME
+      // Não depende de currentTurn pois o winner pode ser o próprio jogador (sem passa por ≠)
+      if (state.vaza.length === 0 || state.status !== 'IN_GAME') setIsPlayingCard(false);
       if (state.corteSwapDone || state.roundCount > 0) {
         setTrumpTwoPrompt(null);
         setSwapPhase(null);
@@ -936,15 +938,24 @@ export default function GameRoom() {
               ) : (
                 <>
                   <AnimatePresence>
-                    {gameState?.players[user?.id || '']?.hand.map(card => (
-                      <motion.div key={card.id}
-                        initial={{ y:100, opacity:0, scale:0.5 }} animate={{ y:0, opacity:1, scale:1 }} exit={{ y:-100, opacity:0 }}
-                        whileHover={{ y:-28, scale:1.08 }}
-                        onClick={() => playCard(card.id)}
-                        className={`${gameState.currentTurn === user?.id ? 'cursor-pointer' : 'opacity-60 pointer-events-none'} flex-shrink-0 origin-bottom`}>
-                        <GameCard card={card} size="hand" />
-                      </motion.div>
-                    ))}
+                    {gameState?.players[user?.id || '']?.hand.map(card => {
+                      const isMyTurn = gameState.currentTurn === user?.id;
+                      const isBlocked = isMyTurn && isPlayingCard;
+                      return (
+                        <motion.div key={card.id}
+                          initial={{ y:100, opacity:0, scale:0.5 }} animate={{ y:0, opacity:1, scale:1 }} exit={{ y:-100, opacity:0 }}
+                          whileHover={isBlocked ? { y:-12, scale:1.03 } : isMyTurn ? { y:-28, scale:1.08 } : {}}
+                          onClick={() => playCard(card.id)}
+                          className={`relative flex-shrink-0 origin-bottom group ${isMyTurn ? (isBlocked ? 'cursor-not-allowed' : 'cursor-pointer') : 'opacity-60 pointer-events-none'}`}>
+                          <GameCard card={card} size="hand" />
+                          {isBlocked && (
+                            <div className="absolute inset-0 flex items-center justify-center rounded-xl opacity-0 group-hover:opacity-100 transition-opacity duration-150 pointer-events-none">
+                              <span className="text-xl drop-shadow-lg select-none">🚫</span>
+                            </div>
+                          )}
+                        </motion.div>
+                      );
+                    })}
                   </AnimatePresence>
                   {(!gameState || gameState.status === 'SHUFFLING') && (
                     <div className="flex gap-2 opacity-10">
