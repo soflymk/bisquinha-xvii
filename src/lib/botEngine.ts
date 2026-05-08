@@ -204,17 +204,39 @@ export function chooseBotCard(
     return pool.reduce((a, b) => a.rank < b.rank ? a : b);
   }
 
-  // ── 3ª ou 4ª POSIÇÃO ─────────────────────────────────────────
-  if (isThirdInVaza || isLastInVaza) {
+  // ── 4ª POSIÇÃO (ÚLTIMO) ───────────────────────────────────────
+  if (isLastInVaza) {
 
-    // REGRA 1: Dupla ganhando → aumentar pontuação da mão
+    // REGRA: Dupla ganhando + último → NUNCA jogar trunfo, só se não tiver jeito
     if (partnerWinning) {
-      // REGRA 3 (exceção): último + dupla ganhando + bisca → jogar pontos, não trunfo
-      // Joga a carta de maior valor em pontos que não seja trunfo
-      const nonTrumpSorted = nonTrump.sort((a, b) => b.points - a.points || b.rank - a.rank);
+      // Maximiza pontos: joga a carta não-trunfo de maior valor
+      const nonTrumpSorted = [...nonTrump].sort((a, b) => b.points - a.points || b.rank - a.rank);
       if (nonTrumpSorted.length > 0) return nonTrumpSorted[0];
-      // Só tem trunfo: descarta o de menor rank
-      return validCards.reduce((a, b) => a.rank < b.rank ? a : b);
+      // Sem opção não-trunfo: joga o menor trunfo possível (último recurso)
+      return safeValidCards.reduce((a, b) => a.rank < b.rank ? a : b);
+    }
+
+    // Adversário ganhando — REGRA 3: bisca na mesa → corta com trunfo
+    if (shouldCutForBisca && safeTrumpCards.length > 0) {
+      const cut = smallestWinner(safeTrumpCards);
+      if (cut) return cut;
+    }
+    // Tenta ganhar com menor custo
+    const winner = smallestWinner(safeValidCards);
+    if (winner) return winner;
+    // Não pode ganhar: descarta menor
+    const pool4 = safeNonTrump.length > 0 ? safeNonTrump : safeValidCards;
+    return pool4.reduce((a, b) => a.rank < b.rank ? a : b);
+  }
+
+  // ── 3ª POSIÇÃO ────────────────────────────────────────────────
+  if (isThirdInVaza) {
+
+    // REGRA 1: Dupla ganhando → aumentar pontuação
+    if (partnerWinning) {
+      const nonTrumpSorted = [...nonTrump].sort((a, b) => b.points - a.points || b.rank - a.rank);
+      if (nonTrumpSorted.length > 0) return nonTrumpSorted[0];
+      return safeValidCards.reduce((a, b) => a.rank < b.rank ? a : b);
     }
 
     // Adversário ganhando

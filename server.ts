@@ -989,21 +989,23 @@ io.on('connection', (socket: any) => {
       const aceEntry   = state.vaza.find(v => v.card.suit === state.trumpSuit && v.card.value === 'A');
       const sevenPos   = state.vaza.findIndex(v => v.card.suit === state.trumpSuit && v.card.value === '7');
       const acePos     = state.vaza.findIndex(v => v.card.suit === state.trumpSuit && v.card.value === 'A');
-      if (sevenEntry && aceEntry && acePos > sevenPos &&
-          state.players[sevenEntry.userId].team !== state.players[aceEntry.userId].team) {
+      // Heley: Ás jogado APÓS o 7 (mesmo time ou não) → ponto vai para a dupla oposta
+      // ao jogador do 7 (inclui "heley amigo" quando ambos são da mesma dupla)
+      if (sevenEntry && aceEntry && acePos > sevenPos) {
         state.heleyOccurred = true;
         const heleyPoints = state.isCopas ? 2 : 1;
-        const aceTeam = state.players[aceEntry.userId].team as 1 | 2;
-        if (aceTeam === 1) state.gameScore.team1 += heleyPoints;
+        const sevenTeam  = state.players[sevenEntry.userId].team as 1 | 2;
+        const heleyTeam: 1 | 2 = sevenTeam === 1 ? 2 : 1;
+        if (heleyTeam === 1) state.gameScore.team1 += heleyPoints;
         else state.gameScore.team2 += heleyPoints;
-        io.to(roomId).emit('heley_notice', { team: aceTeam, points: heleyPoints });
+        io.to(roomId).emit('heley_notice', { team: heleyTeam, points: heleyPoints });
       }
 
       state.players[winnerId].vazaPoints += BiscaEngine.calculateHandPoints(vazaCards);
       io.to(roomId).emit('vaza_resolved', { winnerId, vaza: state.vaza });
       io.to(roomId).emit('game_update', state);
 
-      // 7 de fundo com Ás: revela o Ás com animação
+      // 7 de fundo com Ás: pausa dramática de 2s antes de revelar o Ás para todos
       if (sevenFundoAceCard) {
         const capturedAce = sevenFundoAceCard;
         setTimeout(() => {
@@ -1012,7 +1014,7 @@ io.on('connection', (socket: any) => {
               userId: playerId, nickname: game.nicknames[playerId], aceCard: capturedAce
             });
           }
-        }, 700);
+        }, 2500);
       }
 
       setTimeout(async () => {
@@ -1059,8 +1061,10 @@ io.on('connection', (socket: any) => {
           s.currentTurn = 'SHARING';
           io.to(roomId).emit('game_update', s);
 
-          // Aguarda animações de distribuição + ênfase da carta do corte (3500ms)
-          // antes de mostrar as cartas do parceiro
+          // Em copas não há animação de carta do corte → pausa menor (1500ms).
+          // Em jogo normal aguarda animação do corte (3500ms).
+          const shareDelay = s.isCopas ? 1500 : 3500;
+
           setTimeout(() => {
             if (!activeGames[roomId] || !activeGames[roomId].gameState) return;
             for (let i = 0; i < 4; i++) {
@@ -1077,16 +1081,16 @@ io.on('connection', (socket: any) => {
                 });
               }
             }
-          }, 3500);
+          }, shareDelay);
 
-          // Desbloqueia após animação de compartilhamento completa (3500ms delay + 8500ms animação)
+          // Desbloqueia após animação de compartilhamento completa
           setTimeout(() => {
             if (!activeGames[roomId] || !activeGames[roomId].gameState) return;
             activeGames[roomId].gameState.currentTurn = savedTurn;
             io.to(roomId).emit('game_update', activeGames[roomId].gameState);
             io.to(roomId).emit('last_round_share_done');
             scheduleBotIfNeeded(roomId);
-          }, 3500 + 8500);
+          }, shareDelay + 8500);
           return;
         }
 
