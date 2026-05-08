@@ -559,7 +559,8 @@ io.on('connection', (socket: any) => {
     if (isBater) {
       state.isCopas = true;
       state.trumpSuit = 'Copas';
-      state.cuttingCards = [];
+      // NÃO limpar cuttingCards aqui — o setTimeout abaixo devolve as 5 cartas ao deck
+      // antes de embaralhar. Limpar aqui causaria perda dessas cartas (deck com só 35).
       io.to(roomId).emit('system_message', `${game.nicknames[userId]} BATEU EM COPAS!`);
     } else {
       const card = state.cuttingCards.find(c => c.id === cardId);
@@ -959,13 +960,12 @@ io.on('connection', (socket: any) => {
       if (aceEntry) sevenFundoAceCard = aceEntry;
     }
 
-    // --- Marcar 7 do corte jogado + revelar Ás se NÃO for fundo ---
+    // --- Marcar 7 do corte jogado ---
+    // O reveal do Ás SOMENTE ocorre quando o 7 sai de fundo com o Ás na mão
+    // (trump_seven_fundo_ace_reveal com 2.5s de pausa dramática — vide abaixo).
+    // Jogar o 7 em outras posições NÃO anuncia que o player tem o Ás.
     if (card.suit === state.trumpSuit && card.value === '7') {
       game.sevenTrumpPlayed = true;
-      if (!sevenFundoAceCard) {
-        const hasTrumpAce = player.hand.some((c, i) => i !== cardIdx && c.suit === state.trumpSuit && c.value === 'A');
-        if (hasTrumpAce) io.to(roomId).emit('trump_ace_reveal', { userId: playerId, nickname: game.nicknames[playerId] });
-      }
     }
 
     player.hand.splice(cardIdx, 1);
