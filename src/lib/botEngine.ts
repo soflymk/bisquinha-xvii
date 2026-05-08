@@ -133,87 +133,127 @@ export function chooseBotCard(
     return validCards.reduce((a, b) => a.rank < b.rank ? a : b);
   }
 
-  // Advanced
+  // ══════════════════════════════════════════════════════════════
+  //  ADVANCED
+  // ══════════════════════════════════════════════════════════════
   const vaza = state.vaza;
   const botTeam = teams[botId] as 1 | 2;
-  const isLastInVaza = vaza.length === 3;
+  const isLastInVaza  = vaza.length === 3;
+  const isThirdInVaza = vaza.length === 2;
   const vazaHasPoints = vaza.reduce((acc, v) => acc + v.card.points, 0) > 0;
 
-  // Separa cartas por tipo
-  const nonTrump = validCards.filter(c => c.suit !== trumpSuit);
+  const nonTrump   = validCards.filter(c => c.suit !== trumpSuit);
   const trumpCards = validCards.filter(c => c.suit === trumpSuit);
 
-  // Cartas já jogadas do trunfo
   const playedTrumps = playedCards.filter(c => c.suit === trumpSuit);
   const manyTrumpsOut = trumpSuit ? playedTrumps.length >= 4 : false;
 
+  // ── REGRA 2: Evitar heley — guardar o 7 do corte enquanto o Ás não saiu ──
+  // O heley ocorre quando: adversário joga Ás APÓS o 7 e ganha a vaza.
+  // Estratégia: não jogar o 7 enquanto o Ás do corte ainda está no jogo,
+  // a não ser que seja a única opção válida ou a última carta na mão.
+  const botHasTrumpSeven = validCards.some(c => c.suit === trumpSuit && c.value === '7');
+  const trumpAcePlayed   = playedCards.some(c => c.suit === trumpSuit && c.value === 'A');
+  const shouldAvoidTrumpSeven = (
+    botHasTrumpSeven &&
+    !sevenTrumpPlayed &&   // ninguém jogou o 7 ainda
+    !trumpAcePlayed &&     // Ás ainda não foi jogado
+    validCards.length > 1  // ainda tem outras opções
+  );
+
+  // Pool seguro: exclui o 7 do corte se deve evitá-lo
+  const safeValidCards  = shouldAvoidTrumpSeven
+    ? validCards.filter(c => !(c.suit === trumpSuit && c.value === '7'))
+    : validCards;
+  const safeNonTrump    = safeValidCards.filter(c => c.suit !== trumpSuit);
+  const safeTrumpCards  = safeValidCards.filter(c => c.suit === trumpSuit);
+
+  // ── Estado da vaza atual ──────────────────────────────────────
+  const currentWinnerIdx = vaza.length > 0 ? resolveWinner(vaza, trumpSuit) : -1;
+  const currentWinner    = currentWinnerIdx >= 0 ? vaza[currentWinnerIdx] : null;
+  const partnerWinning   = currentWinner ? teams[currentWinner.userId] === botTeam : false;
+
+  // Há bisca (7 ou Ás de qualquer naipe) na vaza
+  const vazaHasBisca = vaza.some(v => v.card.value === 'A' || v.card.value === '7');
+
+  // REGRA 3: devo cortar quando há bisca, EXCETO se for o último e a dupla já ganha
+  const shouldCutForBisca = vazaHasBisca && !(isLastInVaza && partnerWinning);
+
+  // ── Helper: menor carta vencedora ────────────────────────────
+  const smallestWinner = (pool: Card[]) => {
+    const winners = pool.filter(card => {
+      const testVaza = [...vaza, { userId: botId, card }];
+      const winIdx   = resolveWinner(testVaza, trumpSuit);
+      return testVaza[winIdx].userId === botId;
+    });
+    return winners.length > 0 ? winners.reduce((a, b) => a.rank < b.rank ? a : b) : null;
+  };
+
+  // ── LIDERANDO (1ª posição) ────────────────────────────────────
   if (vaza.length === 0) {
-    // Liderando: joga carta mais forte se tem trunfo forte, senão menor não-trunfo
     if (trumpCards.length > 0 && manyTrumpsOut) {
-      return trumpCards.reduce((a, b) => a.rank > b.rank ? a : b);
+      // Muitos trunfos já saíram: lidera com o maior trunfo (evitando o 7 se necessário)
+      const pool = shouldAvoidTrumpSeven
+        ? trumpCards.filter(c => c.value !== '7')
+        : trumpCards;
+      const chosen = pool.length > 0 ? pool : trumpCards;
+      return chosen.reduce((a, b) => a.rank > b.rank ? a : b);
     }
-    const pool = nonTrump.length > 0 ? nonTrump : validCards;
+    // Lidera com a menor carta segura (não-trunfo, sem o 7 se possível)
+    const pool = safeNonTrump.length > 0 ? safeNonTrump : safeValidCards;
     return pool.reduce((a, b) => a.rank < b.rank ? a : b);
   }
 
-  if (isLastInVaza) {
-    const currentWinnerIdx = resolveWinner(vaza, trumpSuit);
-    const currentWinner = vaza[currentWinnerIdx];
-    const partnerWinning = teams[currentWinner.userId] === botTeam;
+  // ── 3ª ou 4ª POSIÇÃO ─────────────────────────────────────────
+  if (isThirdInVaza || isLastInVaza) {
 
-    if (partnerWinning && !vazaHasPoints) {
-      // Parceiro ganha e vaza sem pontos: descarta menor
-      const pool = nonTrump.length > 0 ? nonTrump : validCards;
-      return pool.reduce((a, b) => a.rank < b.rank ? a : b);
+    // REGRA 1: Dupla ganhando → aumentar pontuação da mão
+    if (partnerWinning) {
+      // REGRA 3 (exceção): último + dupla ganhando + bisca → jogar pontos, não trunfo
+      // Joga a carta de maior valor em pontos que não seja trunfo
+      const nonTrumpSorted = nonTrump.sort((a, b) => b.points - a.points || b.rank - a.rank);
+      if (nonTrumpSorted.length > 0) return nonTrumpSorted[0];
+      // Só tem trunfo: descarta o de menor rank
+      return validCards.reduce((a, b) => a.rank < b.rank ? a : b);
     }
 
-    if (partnerWinning && vazaHasPoints) {
-      // Parceiro ganha vaza com pontos: descarta menor não-trunfo
-      const pool = nonTrump.length > 0 ? nonTrump : validCards;
-      return pool.reduce((a, b) => a.rank < b.rank ? a : b);
+    // Adversário ganhando
+    // REGRA 3: Bisca na mesa → tenta cortar com menor trunfo vencedor
+    if (shouldCutForBisca && safeTrumpCards.length > 0) {
+      const cut = smallestWinner(safeTrumpCards);
+      if (cut) return cut;
     }
 
-    // Adversário ganhando: tenta ganhar com menor custo
-    const winningCards = validCards.filter(card => {
-      const testVaza = [...vaza, { userId: botId, card }];
-      const winIdx = resolveWinner(testVaza, trumpSuit);
-      return testVaza[winIdx].userId === botId;
-    });
+    // Tenta ganhar com menor custo (qualquer carta)
+    const winner = smallestWinner(safeValidCards);
+    if (winner && (vazaHasPoints || isLastInVaza)) return winner;
 
-    if (winningCards.length > 0 && (vazaHasPoints || isLastInVaza)) {
-      return winningCards.reduce((a, b) => a.rank < b.rank ? a : b);
-    }
-
-    // Não pode ganhar: descarta menor
-    const pool = nonTrump.length > 0 ? nonTrump : validCards;
+    // Não pode ganhar: descarta menor (sem desperdiçar o 7 do corte)
+    const pool = safeNonTrump.length > 0 ? safeNonTrump : safeValidCards;
     return pool.reduce((a, b) => a.rank < b.rank ? a : b);
   }
 
-  // Meio da vaza
-  const currentWinnerIdx = resolveWinner(vaza, trumpSuit);
-  const currentWinner = vaza[currentWinnerIdx];
-  const partnerWinning = teams[currentWinner.userId] === botTeam;
-
+  // ── 2ª POSIÇÃO ────────────────────────────────────────────────
   if (partnerWinning) {
-    // Parceiro está ganhando: joga a menor não-trunfo
-    const pool = nonTrump.length > 0 ? nonTrump : validCards;
+    // Parceiro ganhando: descarta menor (conserva trunfo e o 7)
+    const pool = safeNonTrump.length > 0 ? safeNonTrump : safeValidCards;
     return pool.reduce((a, b) => a.rank < b.rank ? a : b);
   }
 
-  // Adversário ganhando: joga carta que pode ganhar se vaza tem valor
+  // REGRA 3: Bisca do adversário → tenta cortar
+  if (shouldCutForBisca && safeTrumpCards.length > 0) {
+    const cut = smallestWinner(safeTrumpCards);
+    if (cut) return cut;
+  }
+
+  // Adversário ganhando: tenta ganhar se vaza tem valor
   if (vazaHasPoints) {
-    const winningCards = validCards.filter(card => {
-      const testVaza = [...vaza, { userId: botId, card }];
-      const winIdx = resolveWinner(testVaza, trumpSuit);
-      return testVaza[winIdx].userId === botId;
-    });
-    if (winningCards.length > 0) {
-      return winningCards.reduce((a, b) => a.rank < b.rank ? a : b);
-    }
+    const winner = smallestWinner(safeValidCards);
+    if (winner) return winner;
   }
 
   // Descarta menor
-  const pool = nonTrump.length > 0 ? nonTrump : validCards;
+  const pool = safeNonTrump.length > 0 ? safeNonTrump : safeValidCards;
   return pool.reduce((a, b) => a.rank < b.rank ? a : b);
 }
 
