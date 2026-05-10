@@ -26,7 +26,6 @@ export default function GameRoom() {
     spectators: { userId: string; nickname: string }[];
     bots: string[];
   }>({ slots: [null, null, null, null], nicknames: {}, teams: {}, ownerId: null, spectators: [], bots: [] });
-  const [botLevel, setBotLevel] = useState<'basic' | 'medium' | 'advanced'>('basic');
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -102,7 +101,6 @@ export default function GameRoom() {
       setGameState(data.gameState);
       setConfig(data.config);
       setRoomData({ slots: data.slots, nicknames: data.nicknames, teams: data.teams, ownerId: data.ownerId, spectators: data.spectators || [], bots: data.bots || [] });
-      if (data.botLevel) setBotLevel(data.botLevel);
       if (data.chat) setMessages(data.chat);
     });
 
@@ -120,7 +118,6 @@ export default function GameRoom() {
     });
 
     socket.on('room_update', (data: any) => { setRoomData(prev => ({ ...prev, ...data, bots: data.bots || prev.bots })); setBotMoveSource(null); });
-    socket.on('bot_level_update', ({ level }: { level: 'basic' | 'medium' | 'advanced' }) => setBotLevel(level));
     socket.on('game_started', (state: GameState) => { setGameState(state); setSysMsg('A partida começou!'); });
     socket.on('game_update', (state: GameState) => {
       setGameState(state);
@@ -273,8 +270,7 @@ export default function GameRoom() {
        'player_disconnected','player_reconnected','trump_ace_reveal',
        'trump_two_available','trump_seven_fundo_ace_reveal','trump_seven_reveal',
        'post_vaza_deal_sequence','corte_card_deal_animation',
-       'last_round_card_share','last_round_share_done',
-       'bot_level_update'
+       'last_round_card_share','last_round_share_done'
       ].forEach(ev => socket.off(ev));
     };
   }, [socket, currentRoomId, user?.id]);
@@ -347,7 +343,6 @@ export default function GameRoom() {
   const moveBot = (fromIdx: number, toIdx: number) => socket?.emit('move_bot', { roomId: currentRoomId, fromIdx, toIdx });
   const removeBot = (botUserId: string) => socket?.emit('remove_bot', { roomId: currentRoomId, botUserId });
   const takeBotSeat = (botSlotIdx: number) => socket?.emit('take_bot_seat', { roomId: currentRoomId, botSlotIdx });
-  const setBotLevelAction = (level: 'basic' | 'medium' | 'advanced') => socket?.emit('set_bot_level', { roomId: currentRoomId, level });
   const restartGame = () => {
     if (!confirm('Reiniciar a partida? O placar da mão atual será perdido, mas os bots permanecerão.')) return;
     socket?.emit('restart_game', { roomId: currentRoomId });
@@ -833,20 +828,6 @@ export default function GameRoom() {
                       );
                     })}
                   </div>
-
-                  {/* Nível dos bots (dono) */}
-                  {user?.id === roomData.ownerId && roomData.bots.length > 0 && (
-                    <div className="flex items-center gap-1.5 bg-slate-900/60 rounded-xl px-3 py-1.5 border border-amber-500/20">
-                      <Bot size={10} className="text-amber-400" />
-                      <span className="text-[8px] text-amber-400 font-black uppercase">Nível:</span>
-                      {(['basic', 'medium', 'advanced'] as const).map(lvl => (
-                        <button key={lvl} onClick={() => setBotLevelAction(lvl)}
-                          className={`text-[7px] font-black uppercase px-2 py-0.5 rounded-lg transition ${botLevel === lvl ? 'bg-amber-600 text-white' : 'bg-slate-800 text-slate-500 hover:text-amber-400'}`}>
-                          {lvl === 'basic' ? 'Básico' : lvl === 'medium' ? 'Médio' : 'Avançado'}
-                        </button>
-                      ))}
-                    </div>
-                  )}
 
                   {user?.id === roomData.ownerId && !gameState && (
                     <button onClick={startGame}

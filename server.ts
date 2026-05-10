@@ -431,7 +431,7 @@ app.post('/api/rooms/create', async (req: any, res) => {
       kickVote: null,
       lastRoundShareDone: false,
       bots: new Set<string>(),
-      botLevel: 'basic',
+      botLevel: 'advanced',
       playedCards: []
     };
     res.json({ roomId });
@@ -1439,16 +1439,6 @@ io.on('connection', (socket: any) => {
       bots: [...game.bots]
     });
     io.to(roomId).emit('queue_updated', { spectators: game.spectators });
-  });
-
-  socket.on('set_bot_level', ({ roomId, level }: { roomId: string; level: BotLevel }) => {
-    const game = activeGames[roomId];
-    if (!game) return;
-    if (game.ownerId !== userId) return socket.emit('error', 'Apenas o dono pode definir o nível dos bots.');
-    if (game.gameState) return socket.emit('error', 'Não é possível alterar durante o jogo.');
-
-    game.botLevel = level;
-    io.to(roomId).emit('bot_level_update', { level });
   });
 
   socket.on('restart_game', async ({ roomId }: { roomId: string }) => {
